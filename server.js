@@ -12,7 +12,7 @@ app.use(bodyParser.json());
 // --- 环境变量读取 ---
 const PORT = process.env.PORT || 3000;
 const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN;
-const TG_CHAT_ID = process.env.TG_CHAT_ID;
+const TG_CHAT_ID = process.env.TG_CHAT_ID; // 这里稍后在Render填你的群ID: -5197011996
 const DATABASE_URL = process.env.DATABASE_URL;
 
 // 检查环境变量
@@ -24,18 +24,59 @@ if (!DATABASE_URL) {
 // --- 数据库连接池 ---
 const pool = new Pool({
     connectionString: DATABASE_URL,
-    ssl: { rejectUnauthorized: false } // Neon 必须开启 SSL
+    ssl: { rejectUnauthorized: false }
 });
 
-// --- TG 机器人 ---
-const bot = new TelegramBot(TG_BOT_TOKEN, { polling: false });
+// --- TG 机器人 (开启 polling 以便监听事件) ---
+// 注意：Render 免费版有时会休眠，Polling 可能会在休眠时断开，但唤醒后会自动重连
+const bot = new TelegramBot(TG_BOT_TOKEN, { polling: true });
+
+// >>>>>> 新增：机器人安保逻辑开始 <<<<<<
+
+// 允许的群 ID (从环境变量获取，确保安全)
+const ALLOWED_GROUP_ID = TG_CHAT_ID; 
+
+bot.on('message', (msg) => {
+    const chatId = msg.chat.id.toString();
+    const chatType = msg.chat.type;
+
+    // 1. 拒绝私聊 (Private)
+    if (chatType === 'private') {
+        // 可以选择回复一句 "禁止私聊"，或者直接 return (装死，推荐装死)
+        return; 
+    }
+
+    // 2. 检查是否在指定群组
+    if (chatId !== ALLOWED_GROUP_ID) {
+        console.log(`检测到未授权群组: ${chatId}，正在退出...`);
+        bot.sendMessage(chatId, "⚠️ 本机器人仅限特定群组使用，再见！")
+           .then(() => bot.leaveChat(chatId))
+           .catch(err => console.error("退出群组失败:", err));
+    }
+});
+
+// 监听被拉入新群组的事件
+bot.on('my_chat_member', (msg) => {
+    const chatId = msg.chat.id.toString();
+    const newStatus = msg.new_chat_member.status;
+
+    // 如果机器人被拉进群 (member) 或被提升为管理员 (administrator)
+    if (newStatus === 'member' || newStatus === 'administrator') {
+        if (chatId !== ALLOWED_GROUP_ID) {
+            bot.sendMessage(chatId, "⚠️ 未授权群组，自动退出。")
+               .then(() => bot.leaveChat(chatId));
+        }
+    }
+});
+
+// >>>>>> 机器人安保逻辑结束 <<<<<<
+
 
 // --- 自动初始化数据库表 ---
 async function initDB() {
     try {
         const client = await pool.connect();
         
-        // 1. 商品表
         await client.query(`
             CREATE TABLE IF NOT EXISTS products (
                 id SERIAL PRIMARY KEY,
@@ -48,7 +89,6 @@ async function initDB() {
             );
         `);
 
-        // 2. 订单表
         await client.query(`
             CREATE TABLE IF NOT EXISTS orders (
                 id SERIAL PRIMARY KEY,
@@ -61,7 +101,6 @@ async function initDB() {
             );
         `);
 
-        // 3. 消息表
         await client.query(`
             CREATE TABLE IF NOT EXISTS messages (
                 id SERIAL PRIMARY KEY,
@@ -72,7 +111,6 @@ async function initDB() {
             );
         `);
 
-        // 4. 设置表 (公告/招聘)
         await client.query(`
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
@@ -80,7 +118,6 @@ async function initDB() {
             );
         `);
 
-        // 初始化默认数据
         const check = await client.query("SELECT * FROM settings WHERE key = 'announcement'");
         if (check.rowCount === 0) {
             await client.query("INSERT INTO settings (key, value) VALUES ($1, $2)", ['announcement', '欢迎来到未来商城！本站支持 USDT 自动支付。']);
@@ -94,18 +131,18 @@ async function initDB() {
         console.error("DB Init Error:", err);
     }
 }
-initDB(); // 启动时运行
+initDB();
 
 // --- 辅助函数 ---
 function sendTG(text) {
     if (bot && TG_CHAT_ID) {
-        bot.sendMessage(TG_CHAT_ID, text).catch(e => console.log("TG Send Error"));
+        // 发送到指定群组
+        bot.sendMessage(TG_CHAT_ID, text).catch(e => console.log("TG Send Error:", e.message));
     }
 }
 
-// --- 业务 API ---
+// --- 业务 API (保持不变) ---
 
-// 1. 公开数据 (首页)
 app.get('/api/public/data', async (req, res) => {
     try {
         const p = await pool.query('SELECT * FROM products ORDER BY id DESC');
@@ -122,7 +159,6 @@ app.get('/api/public/data', async (req, res) => {
     } catch (e) { res.status(500).json({error: e.message}); }
 });
 
-// 2. 下单
 app.post('/api/order', async (req, res) => {
     const { contact, productId, paymentMethod } = req.body;
     try {
@@ -140,7 +176,6 @@ app.post('/api/order', async (req, res) => {
     } catch (e) { res.status(500).json({error: e.message}); }
 });
 
-// 3. 查单
 app.get('/api/order/:id', async (req, res) => {
     try {
         const r = await pool.query('SELECT * FROM orders WHERE order_id = $1', [req.params.id]);
@@ -148,7 +183,6 @@ app.get('/api/order/:id', async (req, res) => {
     } catch (e) { res.status(500).json({error: e.message}); }
 });
 
-// 4. 聊天发送
 app.post('/api/chat/send', async (req, res) => {
     const { sessionId, text } = req.body;
     try {
@@ -158,15 +192,12 @@ app.post('/api/chat/send', async (req, res) => {
     } catch (e) { res.status(500).json({error: e.message}); }
 });
 
-// 5. 聊天历史
 app.get('/api/chat/history/:sid', async (req, res) => {
     try {
         const r = await pool.query('SELECT * FROM messages WHERE session_id = $1 ORDER BY created_at ASC', [req.params.sid]);
         res.json(r.rows);
     } catch (e) { res.status(500).json({error: e.message}); }
 });
-
-// --- 管理员 API ---
 
 app.get('/api/admin/all', async (req, res) => {
     try {
