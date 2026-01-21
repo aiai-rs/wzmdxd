@@ -118,6 +118,8 @@ async function initDB() {
         const client = await pool.connect();
         await client.query(`CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, username TEXT UNIQUE, password TEXT, contact TEXT, created_at TIMESTAMP DEFAULT NOW())`);
         await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS password TEXT`);
+        // 新增：用户余额字段
+        await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS balance NUMERIC DEFAULT 0`);
 
         await client.query(`CREATE TABLE IF NOT EXISTS products (id SERIAL PRIMARY KEY, name TEXT, price TEXT, stock INTEGER, category TEXT, description TEXT, type TEXT DEFAULT 'virtual', image_url TEXT, created_at TIMESTAMP DEFAULT NOW())`);
         // Upgrade: Add is_pinned
@@ -126,9 +128,37 @@ async function initDB() {
         await client.query(`CREATE TABLE IF NOT EXISTS orders (id SERIAL PRIMARY KEY, order_id TEXT UNIQUE, product_name TEXT, contact TEXT, payment_method TEXT, status TEXT DEFAULT '待支付', user_id INTEGER, usdt_amount NUMERIC, cny_amount NUMERIC, snapshot_rate NUMERIC, shipping_info TEXT, expires_at TIMESTAMP, created_at TIMESTAMP DEFAULT NOW())`);
         await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS tracking_number TEXT`);
         await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS fee_amount NUMERIC DEFAULT 0`);
+        // 新增：订单数量字段和二维码字段
+        await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS quantity INTEGER DEFAULT 1`);
+        await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS qrcode_url TEXT`);
 
         await client.query(`CREATE TABLE IF NOT EXISTS messages (id SERIAL PRIMARY KEY, session_id TEXT, sender TEXT, content TEXT, created_at TIMESTAMP DEFAULT NOW())`);
         await client.query(`CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)`);
+
+        // 新增：充值订单表
+        await client.query(`CREATE TABLE IF NOT EXISTS recharge_orders (
+            id SERIAL PRIMARY KEY,
+            order_id TEXT UNIQUE,
+            user_id INTEGER,
+            amount NUMERIC,
+            payment_method TEXT,
+            status TEXT DEFAULT '待支付',
+            created_at TIMESTAMP DEFAULT NOW(),
+            expires_at TIMESTAMP
+        )`);
+
+        // 新增：提现订单表
+        await client.query(`CREATE TABLE IF NOT EXISTS withdraw_orders (
+            id SERIAL PRIMARY KEY,
+            order_id TEXT UNIQUE,
+            user_id INTEGER,
+            amount NUMERIC,
+            fee NUMERIC,
+            actual_amount NUMERIC,
+            payment_method TEXT,
+            status TEXT DEFAULT '待处理',
+            created_at TIMESTAMP DEFAULT NOW()
+        )`);
 
         const checkFee = await client.query("SELECT * FROM settings WHERE key = 'fee_rate'");
         if (checkFee.rowCount === 0) await client.query("INSERT INTO settings (key, value) VALUES ($1, $2)", ['fee_rate', '0']);
@@ -160,7 +190,18 @@ async function checkUsdtDeposits() {
 
             if (match) {
                 await pool.query("UPDATE orders SET status = '已支付' WHERE id = $1", [order.id]);
-                sendTG(`✅ **USDT 到账成功**\n单号: ${order.order_id}\n金额: ${expectedAmount} USDT\n客户已自动发货`);
+                
+                // 新增：计算找零并存入用户余额
+                const exactPrice = parseFloat(order.usdt_amount) - (order.fee_amount || 0);
+                const overpaid = parseFloat(match.value) / 1000000 - exactPrice;
+                if (overpaid > 0.000001) {
+                    await pool.query(
+                        "UPDATE users SET balance = COALESCE(balance, 0) + $1 WHERE id = $2",
+                        [overpaid.toFixed(4), order.user_id]
+                    );
+                }
+                
+                sendTG(`✅ **USDT 到账成功**\n订单编码: \`${order.order_id}\`\n金额: ${expectedAmount} USDT\n客户已自动发货`);
             }
         }
     } catch (e) { console.error("USDT Check Error:", e.message); }
@@ -235,15 +276,147 @@ app.post('/api/user/login', async (req, res) => {
     } catch(e) { res.status(500).json({error: e.message}); }
 });
 
-// 5. Order Logic
+// 5. 获取用户余额
+app.get('/api/user/balance/:userId', async (req, res) => {
+    try {
+        const user = await pool.query('SELECT balance FROM users WHERE id = $1', [req.params.userId]);
+        if (user.rows.length === 0) return res.json({ success: false, msg: '用户不存在' });
+        
+        const rateRes = await pool.query("SELECT value FROM settings WHERE key = 'exchange_rate'");
+        const rate = parseFloat(rateRes.rows[0]?.value || '7.0');
+        const balance = parseFloat(user.rows[0].balance || 0);
+        const cnyBalance = (balance * rate).toFixed(2);
+        
+        res.json({ 
+            success: true, 
+            balance: balance.toFixed(4), 
+            cnyBalance 
+        });
+    } catch (e) { res.status(500).json({error: e.message}); }
+});
+
+// 6. 充值
+app.post('/api/user/recharge', async (req, res) => {
+    const { userId, amount, paymentMethod } = req.body;
+    try {
+        const orderId = 'RECH-' + Date.now().toString().slice(-8);
+        
+        const rateRes = await pool.query("SELECT value FROM settings WHERE key = 'exchange_rate'");
+        const rate = parseFloat(rateRes.rows[0]?.value || '7.0');
+        const feeRes = await pool.query("SELECT value FROM settings WHERE key = 'fee_rate'");
+        const feePercent = parseFloat(feeRes.rows[0]?.value || '0');
+        
+        let usdtAmount = parseFloat(amount);
+        let cnyAmount = usdtAmount * rate;
+        let feeAmount = 0;
+        
+        if (paymentMethod !== 'USDT') {
+            feeAmount = cnyAmount * (feePercent / 100);
+            cnyAmount = cnyAmount + feeAmount;
+        } else {
+            // USDT充值增加随机小数
+            const randomDecimal = (Math.floor(Math.random() * 9000) + 1000) / 10000;
+            usdtAmount = parseFloat((parseFloat(amount) + randomDecimal).toFixed(4));
+        }
+        
+        const expiresAt = new Date(Date.now() + 30 * 60 * 1000);
+        
+        await pool.query(
+            `INSERT INTO recharge_orders (order_id, user_id, amount, payment_method, expires_at) VALUES ($1, $2, $3, $4, $5)`,
+            [orderId, userId, usdtAmount, paymentMethod, expiresAt]
+        );
+        
+        const userRes = await pool.query("SELECT contact FROM users WHERE id = $1", [userId]);
+        const contactStr = userRes.rows[0]?.contact || 'Unknown';
+        
+        let notif = `💰 **充值订单**\n订单编码: \`${orderId}\`\n用户: ${contactStr}\n支付: ${paymentMethod}`;
+        if (paymentMethod === 'USDT') {
+            notif += `\n需付: \`${usdtAmount}\` USDT\n钱包: ${TRON_WALLET_ADDRESS}`;
+        } else {
+            notif += `\n需付: ¥${cnyAmount.toFixed(2)} (含手续费${feePercent}%)`;
+        }
+        
+        sendTG(notif);
+        
+        res.json({ 
+            success: true, 
+            orderId, 
+            usdtAmount, 
+            cnyAmount: cnyAmount.toFixed(2), 
+            wallet: TRON_WALLET_ADDRESS 
+        });
+    } catch (e) { console.error(e); res.status(500).json({error: e.message}); }
+});
+
+// 7. 提现
+app.post('/api/user/withdraw', async (req, res) => {
+    const { userId, amount, paymentMethod } = req.body;
+    try {
+        const user = await pool.query('SELECT balance FROM users WHERE id = $1', [userId]);
+        if (user.rows.length === 0) return res.json({ success: false, msg: '用户不存在' });
+        
+        const balance = parseFloat(user.rows[0].balance || 0);
+        const withdrawAmount = parseFloat(amount);
+        
+        // 检查最低提现金额
+        if (withdrawAmount < 10) {
+            return res.json({ success: false, msg: '最低提现金额为10 USDT' });
+        }
+        
+        if (balance < withdrawAmount) {
+            return res.json({ success: false, msg: '余额不足' });
+        }
+        
+        let fee = 0;
+        let actualAmount = withdrawAmount;
+        
+        if (paymentMethod === '微信' || paymentMethod === '支付宝') {
+            fee = withdrawAmount * 0.01; // 1%手续费
+            actualAmount = withdrawAmount - fee;
+        }
+        
+        const orderId = 'WITH-' + Date.now().toString().slice(-8);
+        
+        await pool.query(
+            `INSERT INTO withdraw_orders (order_id, user_id, amount, fee, actual_amount, payment_method) VALUES ($1, $2, $3, $4, $5, $6)`,
+            [orderId, userId, withdrawAmount, fee, actualAmount, paymentMethod]
+        );
+        
+        // 冻结余额
+        await pool.query(
+            'UPDATE users SET balance = balance - $1 WHERE id = $2',
+            [withdrawAmount, userId]
+        );
+        
+        const userRes = await pool.query("SELECT contact FROM users WHERE id = $1", [userId]);
+        const contactStr = userRes.rows[0]?.contact || 'Unknown';
+        
+        let notif = `💰 **提现申请**\n订单编码: \`${orderId}\`\n用户: ${contactStr}\n提现: ${withdrawAmount} USDT\n方式: ${paymentMethod}`;
+        if (fee > 0) {
+            notif += `\n手续费: ${fee.toFixed(4)} USDT\n实际到账: ${actualAmount.toFixed(4)} USDT`;
+        }
+        
+        sendTG(notif);
+        
+        res.json({ 
+            success: true, 
+            orderId, 
+            amount: withdrawAmount,
+            fee,
+            actualAmount 
+        });
+    } catch (e) { console.error(e); res.status(500).json({error: e.message}); }
+});
+
+// 8. Order Logic (单个商品)
 app.post('/api/order', async (req, res) => {
-    const { userId, productId, paymentMethod, shippingInfo } = req.body;
+    const { userId, productId, paymentMethod, shippingInfo, quantity = 1, useBalance = 0 } = req.body;
     try {
         const prod = await pool.query('SELECT * FROM products WHERE id = $1', [productId]);
         if (prod.rows.length === 0) return res.json({ success: false, msg: '商品不存在' });
 
         const pData = prod.rows[0];
-        const basePrice = parseFloat(pData.price.replace(/[^\d.]/g, ''));
+        const basePrice = parseFloat(pData.price.replace(/[^\d.]/g, '')) * quantity;
         const orderId = 'ORD-' + Date.now().toString().slice(-6);
         
         const rateRes = await pool.query("SELECT value FROM settings WHERE key = 'exchange_rate'");
@@ -264,19 +437,42 @@ app.post('/api/order', async (req, res) => {
         if (paymentMethod === 'USDT') {
             const randomDecimal = (Math.floor(Math.random() * 9000) + 1000) / 10000;
             usdtAmount = parseFloat((basePrice + randomDecimal).toFixed(4));
+            
+            // 使用余额抵扣
+            const useBalanceAmount = parseFloat(useBalance || 0);
+            if (useBalanceAmount > 0) {
+                const user = await pool.query('SELECT balance FROM users WHERE id = $1', [userId]);
+                const userBalance = parseFloat(user.rows[0]?.balance || 0);
+                
+                if (useBalanceAmount > userBalance) {
+                    return res.json({ success: false, msg: '余额不足' });
+                }
+                
+                if (useBalanceAmount >= usdtAmount) {
+                    return res.json({ success: false, msg: '余额支付不能超过订单金额' });
+                }
+                
+                // 扣除余额
+                await pool.query(
+                    'UPDATE users SET balance = balance - $1 WHERE id = $2',
+                    [useBalanceAmount, userId]
+                );
+                
+                usdtAmount = parseFloat((usdtAmount - useBalanceAmount).toFixed(4));
+            }
         }
 
         await pool.query(
             `INSERT INTO orders 
-            (order_id, product_name, contact, payment_method, status, user_id, usdt_amount, cny_amount, snapshot_rate, shipping_info, expires_at, fee_amount) 
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`, 
-            [orderId, pData.name, 'RegUser', paymentMethod, '待支付', userId, usdtAmount, cnyAmount.toFixed(2), rate, JSON.stringify(shippingInfo || {}), expiresAt, feeAmount.toFixed(2)]
+            (order_id, product_name, contact, payment_method, status, user_id, usdt_amount, cny_amount, snapshot_rate, shipping_info, expires_at, fee_amount, quantity) 
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`, 
+            [orderId, pData.name, 'RegUser', paymentMethod, '待支付', userId, usdtAmount, cnyAmount.toFixed(2), rate, JSON.stringify(shippingInfo || {}), expiresAt, feeAmount.toFixed(2), quantity]
         );
 
         const userRes = await pool.query("SELECT contact FROM users WHERE id = $1", [userId]);
         const contactStr = userRes.rows[0]?.contact || 'Unknown';
 
-        let notif = `💰 **新订单**\n单号: \`${orderId}\`\n商品: ${pData.name}\n用户: ${contactStr}\n支付: ${paymentMethod}`;
+        let notif = `💰 **新订单**\n订单编码: \`${orderId}\`\n商品: ${pData.name}\n数量: ${quantity}\n用户: ${contactStr}\n支付: ${paymentMethod}`;
         if (paymentMethod === 'USDT') notif += `\n需付: \`${usdtAmount}\` USDT`;
         else notif += `\n需付: ¥${cnyAmount.toFixed(2)} (含手续费${feePercent}%)`;
 
@@ -286,6 +482,198 @@ app.post('/api/order', async (req, res) => {
 
         sendTG(notif);
         res.json({ success: true, orderId, usdtAmount, cnyAmount: cnyAmount.toFixed(2), wallet: TRON_WALLET_ADDRESS });
+    } catch (e) { console.error(e); res.status(500).json({error: e.message}); }
+});
+
+// 9. 批量订单（购物车）
+app.post('/api/order/batch', async (req, res) => {
+    const { userId, items, paymentMethod, shippingInfo, useBalance = 0 } = req.body;
+    try {
+        if (!items || items.length === 0) return res.json({ success: false, msg: '商品列表为空' });
+        
+        const orderId = 'BATCH-' + Date.now().toString().slice(-6);
+        const rateRes = await pool.query("SELECT value FROM settings WHERE key = 'exchange_rate'");
+        const rate = parseFloat(rateRes.rows[0]?.value || '7.0');
+        const feeRes = await pool.query("SELECT value FROM settings WHERE key = 'fee_rate'");
+        const feePercent = parseFloat(feeRes.rows[0]?.value || '0');
+        
+        let totalUsdt = 0;
+        let productNames = [];
+        
+        // 计算总价和检查库存
+        for (const item of items) {
+            const prod = await pool.query('SELECT * FROM products WHERE id = $1', [item.productId]);
+            if (prod.rows.length === 0) {
+                return res.json({ success: false, msg: `商品ID ${item.productId} 不存在` });
+            }
+            
+            const pData = prod.rows[0];
+            const itemPrice = parseFloat(pData.price.replace(/[^\d.]/g, '')) * item.quantity;
+            totalUsdt += itemPrice;
+            productNames.push(`${pData.name} x${item.quantity}`);
+        }
+        
+        let usdtAmount = totalUsdt;
+        let cnyAmount = totalUsdt * rate;
+        let feeAmount = 0;
+        let expiresAt = new Date(Date.now() + 30 * 60 * 1000);
+        
+        if (paymentMethod !== 'USDT') {
+            feeAmount = cnyAmount * (feePercent / 100);
+            cnyAmount = cnyAmount + feeAmount;
+        }
+        
+        if (paymentMethod === 'USDT') {
+            const randomDecimal = (Math.floor(Math.random() * 9000) + 1000) / 10000;
+            usdtAmount = parseFloat((totalUsdt + randomDecimal).toFixed(4));
+            
+            // 使用余额抵扣
+            const useBalanceAmount = parseFloat(useBalance || 0);
+            if (useBalanceAmount > 0) {
+                const user = await pool.query('SELECT balance FROM users WHERE id = $1', [userId]);
+                const userBalance = parseFloat(user.rows[0]?.balance || 0);
+                
+                if (useBalanceAmount > userBalance) {
+                    return res.json({ success: false, msg: '余额不足' });
+                }
+                
+                if (useBalanceAmount >= usdtAmount) {
+                    return res.json({ success: false, msg: '余额支付不能超过订单金额' });
+                }
+                
+                // 扣除余额
+                await pool.query(
+                    'UPDATE users SET balance = balance - $1 WHERE id = $2',
+                    [useBalanceAmount, userId]
+                );
+                
+                usdtAmount = parseFloat((usdtAmount - useBalanceAmount).toFixed(4));
+            }
+        }
+        
+        // 创建主订单记录
+        await pool.query(
+            `INSERT INTO orders 
+            (order_id, product_name, contact, payment_method, status, user_id, usdt_amount, cny_amount, snapshot_rate, shipping_info, expires_at, fee_amount, quantity) 
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`, 
+            [orderId, productNames.join(' + '), 'RegUser', paymentMethod, '待支付', userId, usdtAmount, cnyAmount.toFixed(2), rate, JSON.stringify(shippingInfo || {}), expiresAt, feeAmount.toFixed(2), items.reduce((sum, item) => sum + item.quantity, 0)]
+        );
+        
+        const userRes = await pool.query("SELECT contact FROM users WHERE id = $1", [userId]);
+        const contactStr = userRes.rows[0]?.contact || 'Unknown';
+        
+        let notif = `💰 **批量订单**\n订单编码: \`${orderId}\`\n商品: ${productNames.join(', ')}\n用户: ${contactStr}\n支付: ${paymentMethod}`;
+        if (paymentMethod === 'USDT') notif += `\n需付: \`${usdtAmount}\` USDT`;
+        else notif += `\n需付: ¥${cnyAmount.toFixed(2)} (含手续费${feePercent}%)`;
+        
+        if (shippingInfo && shippingInfo.name) {
+            notif += `\n\n📦 **发货信息**\n收件人: ${shippingInfo.name}\n电话: ${shippingInfo.tel}\n地址: ${shippingInfo.addr}`;
+        }
+        
+        sendTG(notif);
+        res.json({ success: true, orderId, usdtAmount, cnyAmount: cnyAmount.toFixed(2), wallet: TRON_WALLET_ADDRESS });
+    } catch (e) { console.error(e); res.status(500).json({error: e.message}); }
+});
+
+// 10. 修改支付方式
+app.post('/api/order/change_payment', async (req, res) => {
+    const { orderId, userId, newPaymentMethod } = req.body;
+    try {
+        const order = await pool.query(
+            "SELECT * FROM orders WHERE order_id = $1 AND user_id = $2 AND status = '待支付'",
+            [orderId, userId]
+        );
+        
+        if (order.rows.length === 0) {
+            return res.json({ success: false, msg: '订单不存在或无法修改' });
+        }
+        
+        const oldOrder = order.rows[0];
+        const baseUsdt = oldOrder.usdt_amount - oldOrder.fee_amount;
+        
+        const rateRes = await pool.query("SELECT value FROM settings WHERE key = 'exchange_rate'");
+        const rate = parseFloat(rateRes.rows[0]?.value || '7.0');
+        const feeRes = await pool.query("SELECT value FROM settings WHERE key = 'fee_rate'");
+        const feePercent = parseFloat(feeRes.rows[0]?.value || '0');
+        
+        let usdtAmount = baseUsdt;
+        let cnyAmount = baseUsdt * rate;
+        let feeAmount = 0;
+        
+        if (newPaymentMethod !== 'USDT') {
+            feeAmount = cnyAmount * (feePercent / 100);
+            cnyAmount = cnyAmount + feeAmount;
+        } else {
+            const randomDecimal = (Math.floor(Math.random() * 9000) + 1000) / 10000;
+            usdtAmount = parseFloat((baseUsdt + randomDecimal).toFixed(4));
+        }
+        
+        await pool.query(
+            "UPDATE orders SET payment_method = $1, usdt_amount = $2, cny_amount = $3, fee_amount = $4, expires_at = $5 WHERE order_id = $6",
+            [newPaymentMethod, usdtAmount, cnyAmount.toFixed(2), feeAmount, new Date(Date.now() + 30 * 60 * 1000), orderId]
+        );
+        
+        const userRes = await pool.query("SELECT contact FROM users WHERE id = $1", [userId]);
+        const contactStr = userRes.rows[0]?.contact || 'Unknown';
+        
+        let notif = `🔄 **支付方式修改**\n订单编码: \`${orderId}\`\n用户: ${contactStr}\n新支付方式: ${newPaymentMethod}`;
+        if (newPaymentMethod === 'USDT') {
+            notif += `\n需付: \`${usdtAmount}\` USDT`;
+        } else {
+            notif += `\n需付: ¥${cnyAmount.toFixed(2)} (含手续费${feePercent}%)`;
+        }
+        
+        sendTG(notif);
+        res.json({ success: true, orderId, usdtAmount, cnyAmount: cnyAmount.toFixed(2) });
+    } catch (e) { console.error(e); res.status(500).json({error: e.message}); }
+});
+
+// 11. 用户确认支付
+app.post('/api/order/confirm_payment', async (req, res) => {
+    const { orderId, userId } = req.body;
+    try {
+        const order = await pool.query(
+            "SELECT * FROM orders WHERE order_id = $1 AND user_id = $2 AND status = '待支付'",
+            [orderId, userId]
+        );
+        
+        if (order.rows.length === 0) {
+            return res.json({ success: false, msg: '订单不存在' });
+        }
+        
+        await pool.query(
+            "UPDATE orders SET status = '已支付' WHERE order_id = $1",
+            [orderId]
+        );
+        
+        const userRes = await pool.query("SELECT contact FROM users WHERE id = $1", [userId]);
+        const contactStr = userRes.rows[0]?.contact || 'Unknown';
+        
+        sendTG(`✅ **用户确认支付**\n订单编码: \`${orderId}\`\n用户: ${contactStr}\n用户已确认完成支付`);
+        
+        res.json({ success: true });
+    } catch (e) { console.error(e); res.status(500).json({error: e.message}); }
+});
+
+// 12. 用户报告二维码问题
+app.post('/api/order/report_qrcode', async (req, res) => {
+    const { orderId, userId, reason } = req.body;
+    try {
+        const order = await pool.query(
+            "SELECT * FROM orders WHERE order_id = $1 AND user_id = $2",
+            [orderId, userId]
+        );
+        
+        if (order.rows.length === 0) {
+            return res.json({ success: false, msg: '订单不存在' });
+        }
+        
+        const userRes = await pool.query("SELECT contact FROM users WHERE id = $1", [userId]);
+        const contactStr = userRes.rows[0]?.contact || 'Unknown';
+        
+        sendTG(`⚠️ **二维码问题报告**\n订单编码: \`${orderId}\`\n用户: ${contactStr}\n问题: ${reason || '未说明原因'}`);
+        
+        res.json({ success: true });
     } catch (e) { console.error(e); res.status(500).json({error: e.message}); }
 });
 
@@ -303,6 +691,22 @@ app.post('/api/order/cancel', async (req, res) => {
 });
 
 // Admin Operations (Protected)
+
+// 上传支付二维码
+app.post('/api/admin/order/upload_qrcode', authAdmin, upload.single('qrcode'), async (req, res) => {
+    const { orderId } = req.body;
+    try {
+        if (!req.file) return res.status(400).json({ error: 'No file uploaded or invalid type' });
+        const fileUrl = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
+        
+        await pool.query("UPDATE orders SET qrcode_url = $1 WHERE order_id = $2", [fileUrl, orderId]);
+        
+        sendTG(`📱 **二维码已上传**\n订单编码: \`${orderId}\`\n用户可扫码支付`);
+        
+        res.json({ success: true, qrcodeUrl: fileUrl });
+    } catch (e) { res.status(500).json({error: e.message}); }
+});
+
 app.post('/api/admin/order/ship', authAdmin, async (req, res) => {
     const { orderId, trackingNumber } = req.body;
     try {
