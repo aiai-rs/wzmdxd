@@ -10,43 +10,85 @@ const path = require('path');
 const fs = require('fs');
 const bcrypt = require('bcryptjs');
 const rateLimit = require('express-rate-limit');
+const sharp = require('sharp');
 
 const app = express();
-app.use(cors());
-app.use(bodyParser.json());
+app.use(cors({
+    origin: '*',
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+    credentials: true
+}));
+app.use(bodyParser.json({ limit: '10mb' }));
+app.use(bodyParser.urlencoded({ extended: true, limit: '10mb' }));
+
+// --- 优化：增加内存缓存 ---
+let cache = {
+    publicData: null,
+    cacheTime: 0,
+    announcements: {}
+};
 
 // --- Security: Rate Limiting ---
 const apiLimiter = rateLimit({
-    windowMs: 1 * 60 * 1000, // 1 minute
-    max: 100, // Limit each IP to 100 requests per windowMs
+    windowMs: 1 * 60 * 1000,
+    max: 200,
     standardHeaders: true,
     legacyHeaders: false,
 });
 app.use('/api/', apiLimiter);
 
 // --- Static Files ---
-if (!fs.existsSync('uploads')) { fs.mkdirSync('uploads'); }
+if (!fs.existsSync('uploads')) { 
+    fs.mkdirSync('uploads', { recursive: true });
+    fs.mkdirSync('uploads/thumbs', { recursive: true });
+}
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
-// --- Security: File Upload Filter ---
+// --- Security: File Upload Filter - 优化上传速度 ---
 const storage = multer.diskStorage({
-    destination: function (req, file, cb) { cb(null, 'uploads/') },
+    destination: function (req, file, cb) { 
+        cb(null, 'uploads/') 
+    },
     filename: function (req, file, cb) {
         const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-        cb(null, uniqueSuffix + path.extname(file.originalname));
+        cb(null, uniqueSuffix + path.extname(file.originalname).toLowerCase());
     }
 });
+
 const fileFilter = (req, file, cb) => {
-    const allowedTypes = /jpeg|jpg|png|gif/;
+    const allowedTypes = /jpeg|jpg|png|gif|webp/;
     const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
     const mimetype = allowedTypes.test(file.mimetype);
     if (mimetype && extname) {
         return cb(null, true);
     } else {
-        cb(new Error('Only images are allowed'));
+        cb(new Error('只允许上传图片文件 (jpeg, jpg, png, gif, webp)'));
     }
 };
-const upload = multer({ storage: storage, fileFilter: fileFilter });
+
+const upload = multer({ 
+    storage: storage, 
+    fileFilter: fileFilter,
+    limits: {
+        fileSize: 10 * 1024 * 1024 // 10MB
+    }
+});
+
+// --- 图片压缩函数 ---
+async function compressImage(filePath) {
+    try {
+        const compressedPath = path.join('uploads/thumbs', path.basename(filePath));
+        await sharp(filePath)
+            .resize(800, 800, { fit: 'inside', withoutEnlargement: true })
+            .jpeg({ quality: 80 })
+            .toFile(compressedPath);
+        return compressedPath;
+    } catch (error) {
+        console.error('图片压缩失败:', error);
+        return filePath;
+    }
+}
 
 // --- Environment Variables ---
 const PORT = process.env.PORT || 3000;
@@ -55,14 +97,17 @@ const TG_CHAT_ID = process.env.TG_CHAT_ID;
 const DATABASE_URL = process.env.DATABASE_URL;
 const TRON_WALLET_ADDRESS = process.env.TRON_WALLET_ADDRESS;
 const ADMIN_USER = process.env.ADMIN_USER || 'admin';
-const ADMIN_PASS = process.env.ADMIN_PASS || '123456'; // Default, change in prod
-let ADMIN_TOKEN_STORE = null; // Simple in-memory token store for demo
+const ADMIN_PASS = process.env.ADMIN_PASS || '123456';
+let ADMIN_TOKEN_STORE = null;
 
 if (!DATABASE_URL) { console.error("Missing DATABASE_URL"); process.exit(1); }
 
 const pool = new Pool({
     connectionString: DATABASE_URL,
-    ssl: { rejectUnauthorized: false }
+    ssl: { rejectUnauthorized: false },
+    max: 20,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 5000
 });
 
 const bot = new TelegramBot(TG_BOT_TOKEN, { polling: true });
@@ -91,6 +136,7 @@ bot.on('message', async (msg) => {
         const rate = parseFloat(text.split(' ')[1]);
         if (!isNaN(rate) && rate > 0) {
             await pool.query("INSERT INTO settings (key, value) VALUES ('exchange_rate', $1) ON CONFLICT (key) DO UPDATE SET value = $1", [rate.toString()]);
+            cache.publicData = null; // 清除缓存
             bot.sendMessage(chatId, `✅ 汇率已更新为: 1 USDT = ${rate} CNY`);
         }
     }
@@ -98,6 +144,7 @@ bot.on('message', async (msg) => {
         const fee = parseFloat(text.split(' ')[1]);
         if (!isNaN(fee) && fee >= 0) {
             await pool.query("INSERT INTO settings (key, value) VALUES ('fee_rate', $1) ON CONFLICT (key) DO UPDATE SET value = $1", [fee.toString()]);
+            cache.publicData = null; // 清除缓存
             bot.sendMessage(chatId, `✅ 支付手续费已更新为: ${fee}%`);
         }
     }
@@ -118,21 +165,24 @@ async function initDB() {
         const client = await pool.connect();
         await client.query(`CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, username TEXT UNIQUE, password TEXT, contact TEXT, created_at TIMESTAMP DEFAULT NOW())`);
         await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS password TEXT`);
-        // 新增：用户余额字段
         await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS balance NUMERIC DEFAULT 0`);
+        // 新增：用户显示名
+        await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name TEXT`);
 
         await client.query(`CREATE TABLE IF NOT EXISTS products (id SERIAL PRIMARY KEY, name TEXT, price TEXT, stock INTEGER, category TEXT, description TEXT, type TEXT DEFAULT 'virtual', image_url TEXT, created_at TIMESTAMP DEFAULT NOW())`);
-        // Upgrade: Add is_pinned
         await client.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS is_pinned BOOLEAN DEFAULT FALSE`);
         
         await client.query(`CREATE TABLE IF NOT EXISTS orders (id SERIAL PRIMARY KEY, order_id TEXT UNIQUE, product_name TEXT, contact TEXT, payment_method TEXT, status TEXT DEFAULT '待支付', user_id INTEGER, usdt_amount NUMERIC, cny_amount NUMERIC, snapshot_rate NUMERIC, shipping_info TEXT, expires_at TIMESTAMP, created_at TIMESTAMP DEFAULT NOW())`);
         await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS tracking_number TEXT`);
         await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS fee_amount NUMERIC DEFAULT 0`);
-        // 新增：订单数量字段和二维码字段
         await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS quantity INTEGER DEFAULT 1`);
         await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS qrcode_url TEXT`);
+        // 新增：订单通知状态
+        await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS notified_qrcode BOOLEAN DEFAULT FALSE`);
 
         await client.query(`CREATE TABLE IF NOT EXISTS messages (id SERIAL PRIMARY KEY, session_id TEXT, sender TEXT, content TEXT, created_at TIMESTAMP DEFAULT NOW())`);
+        // 新增：消息已读状态
+        await client.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_read BOOLEAN DEFAULT FALSE`);
         await client.query(`CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)`);
 
         // 新增：充值订单表
@@ -143,6 +193,8 @@ async function initDB() {
             amount NUMERIC,
             payment_method TEXT,
             status TEXT DEFAULT '待支付',
+            qrcode_url TEXT,
+            notified_qrcode BOOLEAN DEFAULT FALSE,
             created_at TIMESTAMP DEFAULT NOW(),
             expires_at TIMESTAMP
         )`);
@@ -191,7 +243,7 @@ async function checkUsdtDeposits() {
             if (match) {
                 await pool.query("UPDATE orders SET status = '已支付' WHERE id = $1", [order.id]);
                 
-                // 新增：计算找零并存入用户余额
+                // 计算找零并存入用户余额
                 const exactPrice = parseFloat(order.usdt_amount) - (order.fee_amount || 0);
                 const overpaid = parseFloat(match.value) / 1000000 - exactPrice;
                 if (overpaid > 0.000001) {
@@ -225,15 +277,34 @@ app.post('/api/admin/login', (req, res) => {
     }
 });
 
-// 2. File Upload (Protected)
-app.post('/api/upload', authAdmin, upload.single('file'), (req, res) => {
+// 2. File Upload (Protected) - 优化上传速度
+app.post('/api/upload', authAdmin, upload.single('file'), async (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded or invalid type' });
-    const fileUrl = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
-    res.json({ url: fileUrl });
+    
+    try {
+        // 压缩图片
+        const compressedPath = await compressImage(req.file.path);
+        const fileUrl = `${req.protocol}://${req.get('host')}/uploads/${path.basename(compressedPath)}`;
+        
+        res.json({ 
+            success: true, 
+            url: fileUrl,
+            thumbUrl: fileUrl.replace('uploads/', 'uploads/thumbs/')
+        });
+    } catch (error) {
+        console.error('上传失败:', error);
+        res.status(500).json({ error: '文件上传失败' });
+    }
 });
 
-// 3. Public Data (Sort by pinned)
+// 3. Public Data (Sort by pinned) - 增加缓存
 app.get('/api/public/data', async (req, res) => {
+    // 使用缓存，5秒内重复请求返回缓存数据
+    const now = Date.now();
+    if (cache.publicData && (now - cache.cacheTime) < 5000) {
+        return res.json(cache.publicData);
+    }
+    
     try {
         const p = await pool.query('SELECT * FROM products ORDER BY is_pinned DESC, id DESC');
         const c = await pool.query('SELECT DISTINCT category FROM products');
@@ -243,7 +314,7 @@ app.get('/api/public/data', async (req, res) => {
         const fee = await pool.query("SELECT value FROM settings WHERE key = 'fee_rate'");
         const popup = await pool.query("SELECT value FROM settings WHERE key = 'announcement_popup'");
         
-        res.json({
+        const result = {
             products: p.rows,
             categories: c.rows.map(r => r.category),
             announcement: a.rows[0]?.value || '',
@@ -251,35 +322,89 @@ app.get('/api/public/data', async (req, res) => {
             rate: parseFloat(rate.rows[0]?.value || '7.0'),
             feeRate: parseFloat(fee.rows[0]?.value || '0'),
             showPopup: popup.rows[0]?.value === 'true'
-        });
-    } catch (e) { res.status(500).json({error: e.message}); }
+        };
+        
+        // 缓存结果
+        cache.publicData = result;
+        cache.cacheTime = now;
+        
+        res.json(result);
+    } catch (e) { 
+        console.error('获取公开数据错误:', e);
+        res.status(500).json({error: e.message}); 
+    }
 });
 
-// 4. User Auth (Hashed)
+// 4. User Auth (Hashed) - 添加密码确认和显示名
+app.post('/api/user/register', async (req, res) => {
+    const { contact, password, confirmPassword, displayName } = req.body;
+    
+    if (!contact || !password || !confirmPassword) {
+        return res.status(400).json({ success: false, msg: '请填写所有必填项' });
+    }
+    
+    if (password !== confirmPassword) {
+        return res.json({ success: false, msg: '两次密码不一致' });
+    }
+    
+    if (password.length < 6) {
+        return res.json({ success: false, msg: '密码长度至少6位' });
+    }
+    
+    try {
+        // 检查用户是否已存在
+        const existingUser = await pool.query("SELECT * FROM users WHERE contact = $1", [contact]);
+        if (existingUser.rows.length > 0) {
+            return res.json({ success: false, msg: '该账号已存在' });
+        }
+        
+        // 创建新用户
+        const hash = await bcrypt.hash(password, 10);
+        const ins = await pool.query(
+            "INSERT INTO users (username, contact, password, display_name, created_at) VALUES ($1, $1, $2, $3, NOW()) RETURNING id, contact, display_name",
+            [contact, hash, displayName || contact]
+        );
+        
+        res.json({ 
+            success: true, 
+            userId: ins.rows[0].id,
+            contact: ins.rows[0].contact,
+            displayName: ins.rows[0].display_name
+        });
+    } catch(e) { 
+        console.error('注册错误:', e);
+        res.status(500).json({success: false, msg: '注册失败'}); 
+    }
+});
+
 app.post('/api/user/login', async (req, res) => {
     const { contact, password } = req.body;
-    if(!contact || !password) return res.status(400).json({error: "Need contact and password"});
+    if(!contact || !password) return res.status(400).json({success: false, msg: "需要账号和密码"});
     
     try {
         let user = await pool.query("SELECT * FROM users WHERE contact = $1", [contact]);
         if (user.rows.length === 0) {
-            // Register
-            const hash = await bcrypt.hash(password, 10);
-            const ins = await pool.query("INSERT INTO users (username, contact, password) VALUES ($1, $1, $2) RETURNING id", [contact, hash]);
-            return res.json({ success: true, userId: ins.rows[0].id, isNew: true });
+            return res.json({ success: false, msg: "账号不存在" });
         } else {
-            // Login
             const match = await bcrypt.compare(password, user.rows[0].password);
             if (!match) return res.json({ success: false, msg: "密码错误" });
-            res.json({ success: true, userId: user.rows[0].id });
+            res.json({ 
+                success: true, 
+                userId: user.rows[0].id,
+                contact: user.rows[0].contact,
+                displayName: user.rows[0].display_name || user.rows[0].contact
+            });
         }
-    } catch(e) { res.status(500).json({error: e.message}); }
+    } catch(e) { 
+        console.error('登录错误:', e);
+        res.status(500).json({success: false, msg: "登录失败"}); 
+    }
 });
 
-// 5. 获取用户余额
-app.get('/api/user/balance/:userId', async (req, res) => {
+// 5. 获取用户信息
+app.get('/api/user/info/:userId', async (req, res) => {
     try {
-        const user = await pool.query('SELECT balance FROM users WHERE id = $1', [req.params.userId]);
+        const user = await pool.query('SELECT id, contact, display_name, balance, created_at FROM users WHERE id = $1', [req.params.userId]);
         if (user.rows.length === 0) return res.json({ success: false, msg: '用户不存在' });
         
         const rateRes = await pool.query("SELECT value FROM settings WHERE key = 'exchange_rate'");
@@ -289,13 +414,56 @@ app.get('/api/user/balance/:userId', async (req, res) => {
         
         res.json({ 
             success: true, 
+            user: user.rows[0],
             balance: balance.toFixed(4), 
             cnyBalance 
         });
-    } catch (e) { res.status(500).json({error: e.message}); }
+    } catch (e) { 
+        console.error('获取用户信息错误:', e);
+        res.status(500).json({success: false, msg: '获取用户信息失败'}); 
+    }
 });
 
-// 6. 充值
+// 6. 修改密码
+app.post('/api/user/change_password', async (req, res) => {
+    const { userId, oldPassword, newPassword, confirmPassword } = req.body;
+    
+    if (!userId || !oldPassword || !newPassword || !confirmPassword) {
+        return res.json({ success: false, msg: '请填写所有必填项' });
+    }
+    
+    if (newPassword !== confirmPassword) {
+        return res.json({ success: false, msg: '两次新密码不一致' });
+    }
+    
+    if (newPassword.length < 6) {
+        return res.json({ success: false, msg: '新密码长度至少6位' });
+    }
+    
+    try {
+        // 验证旧密码
+        const user = await pool.query('SELECT password FROM users WHERE id = $1', [userId]);
+        if (user.rows.length === 0) {
+            return res.json({ success: false, msg: '用户不存在' });
+        }
+        
+        const match = await bcrypt.compare(oldPassword, user.rows[0].password);
+        if (!match) {
+            return res.json({ success: false, msg: '原密码错误' });
+        }
+        
+        // 更新密码
+        const hash = await bcrypt.hash(newPassword, 10);
+        await pool.query('UPDATE users SET password = $1 WHERE id = $2', [hash, userId]);
+        
+        res.json({ success: true, msg: '密码修改成功' });
+    } catch (e) {
+        console.error('修改密码错误:', e);
+        res.status(500).json({ success: false, msg: '修改密码失败' });
+    }
+});
+
+// 7. 充值
 app.post('/api/user/recharge', async (req, res) => {
     const { userId, amount, paymentMethod } = req.body;
     try {
@@ -345,10 +513,41 @@ app.post('/api/user/recharge', async (req, res) => {
             cnyAmount: cnyAmount.toFixed(2), 
             wallet: TRON_WALLET_ADDRESS 
         });
-    } catch (e) { console.error(e); res.status(500).json({error: e.message}); }
+    } catch (e) { 
+        console.error(e); 
+        res.status(500).json({success: false, msg: e.message}); 
+    }
 });
 
-// 7. 提现
+// 8. 获取充值记录
+app.get('/api/user/recharge/:userId', async (req, res) => {
+    try {
+        const records = await pool.query(
+            'SELECT * FROM recharge_orders WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50',
+            [req.params.userId]
+        );
+        res.json({ success: true, records: records.rows });
+    } catch (e) {
+        console.error('获取充值记录错误:', e);
+        res.status(500).json({ success: false, msg: '获取充值记录失败' });
+    }
+});
+
+// 9. 获取提现记录
+app.get('/api/user/withdraw/:userId', async (req, res) => {
+    try {
+        const records = await pool.query(
+            'SELECT * FROM withdraw_orders WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50',
+            [req.params.userId]
+        );
+        res.json({ success: true, records: records.rows });
+    } catch (e) {
+        console.error('获取提现记录错误:', e);
+        res.status(500).json({ success: false, msg: '获取提现记录失败' });
+    }
+});
+
+// 10. 提现
 app.post('/api/user/withdraw', async (req, res) => {
     const { userId, amount, paymentMethod } = req.body;
     try {
@@ -405,10 +604,13 @@ app.post('/api/user/withdraw', async (req, res) => {
             fee,
             actualAmount 
         });
-    } catch (e) { console.error(e); res.status(500).json({error: e.message}); }
+    } catch (e) { 
+        console.error(e); 
+        res.status(500).json({success: false, msg: e.message}); 
+    }
 });
 
-// 8. Order Logic (单个商品)
+// 11. Order Logic (单个商品)
 app.post('/api/order', async (req, res) => {
     const { userId, productId, paymentMethod, shippingInfo, quantity = 1, useBalance = 0 } = req.body;
     try {
@@ -482,10 +684,13 @@ app.post('/api/order', async (req, res) => {
 
         sendTG(notif);
         res.json({ success: true, orderId, usdtAmount, cnyAmount: cnyAmount.toFixed(2), wallet: TRON_WALLET_ADDRESS });
-    } catch (e) { console.error(e); res.status(500).json({error: e.message}); }
+    } catch (e) { 
+        console.error(e); 
+        res.status(500).json({success: false, msg: e.message}); 
+    }
 });
 
-// 9. 批量订单（购物车）
+// 12. 批量订单（购物车）
 app.post('/api/order/batch', async (req, res) => {
     const { userId, items, paymentMethod, shippingInfo, useBalance = 0 } = req.body;
     try {
@@ -572,10 +777,13 @@ app.post('/api/order/batch', async (req, res) => {
         
         sendTG(notif);
         res.json({ success: true, orderId, usdtAmount, cnyAmount: cnyAmount.toFixed(2), wallet: TRON_WALLET_ADDRESS });
-    } catch (e) { console.error(e); res.status(500).json({error: e.message}); }
+    } catch (e) { 
+        console.error(e); 
+        res.status(500).json({success: false, msg: e.message}); 
+    }
 });
 
-// 10. 修改支付方式
+// 13. 修改支付方式
 app.post('/api/order/change_payment', async (req, res) => {
     const { orderId, userId, newPaymentMethod } = req.body;
     try {
@@ -625,10 +833,13 @@ app.post('/api/order/change_payment', async (req, res) => {
         
         sendTG(notif);
         res.json({ success: true, orderId, usdtAmount, cnyAmount: cnyAmount.toFixed(2) });
-    } catch (e) { console.error(e); res.status(500).json({error: e.message}); }
+    } catch (e) { 
+        console.error(e); 
+        res.status(500).json({success: false, msg: e.message}); 
+    }
 });
 
-// 11. 用户确认支付
+// 14. 用户确认支付
 app.post('/api/order/confirm_payment', async (req, res) => {
     const { orderId, userId } = req.body;
     try {
@@ -652,10 +863,13 @@ app.post('/api/order/confirm_payment', async (req, res) => {
         sendTG(`✅ **用户确认支付**\n订单编码: \`${orderId}\`\n用户: ${contactStr}\n用户已确认完成支付`);
         
         res.json({ success: true });
-    } catch (e) { console.error(e); res.status(500).json({error: e.message}); }
+    } catch (e) { 
+        console.error(e); 
+        res.status(500).json({success: false, msg: e.message}); 
+    }
 });
 
-// 12. 用户报告二维码问题
+// 15. 用户报告二维码问题
 app.post('/api/order/report_qrcode', async (req, res) => {
     const { orderId, userId, reason } = req.body;
     try {
@@ -674,7 +888,52 @@ app.post('/api/order/report_qrcode', async (req, res) => {
         sendTG(`⚠️ **二维码问题报告**\n订单编码: \`${orderId}\`\n用户: ${contactStr}\n问题: ${reason || '未说明原因'}`);
         
         res.json({ success: true });
-    } catch (e) { console.error(e); res.status(500).json({error: e.message}); }
+    } catch (e) { 
+        console.error(e); 
+        res.status(500).json({success: false, msg: e.message}); 
+    }
+});
+
+// 16. 获取订单详情（包含二维码状态）
+app.get('/api/order/detail/:orderId', async (req, res) => {
+    try {
+        const order = await pool.query('SELECT * FROM orders WHERE order_id = $1', [req.params.orderId]);
+        if (order.rows.length === 0) {
+            return res.json({ success: false, msg: '订单不存在' });
+        }
+        res.json({ success: true, order: order.rows[0] });
+    } catch (e) {
+        console.error('获取订单详情错误:', e);
+        res.status(500).json({ success: false, msg: '获取订单详情失败' });
+    }
+});
+
+// 17. 检查新消息（用于红点通知）
+app.get('/api/chat/unread/:sessionId', async (req, res) => {
+    try {
+        const unread = await pool.query(
+            "SELECT COUNT(*) as count FROM messages WHERE session_id = $1 AND sender = 'admin' AND is_read = false",
+            [req.params.sessionId]
+        );
+        res.json({ success: true, count: parseInt(unread.rows[0].count) });
+    } catch (e) {
+        console.error('检查未读消息错误:', e);
+        res.status(500).json({ success: false, msg: '检查未读消息失败' });
+    }
+});
+
+// 18. 标记消息为已读
+app.post('/api/chat/mark_read/:sessionId', async (req, res) => {
+    try {
+        await pool.query(
+            "UPDATE messages SET is_read = true WHERE session_id = $1 AND sender = 'admin'",
+            [req.params.sessionId]
+        );
+        res.json({ success: true });
+    } catch (e) {
+        console.error('标记消息已读错误:', e);
+        res.status(500).json({ success: false, msg: '标记消息已读失败' });
+    }
 });
 
 // Cancel Order
@@ -687,24 +946,133 @@ app.post('/api/order/cancel', async (req, res) => {
         
         await pool.query("UPDATE orders SET status = '已取消' WHERE order_id = $1", [orderId]);
         res.json({success: true});
-    } catch(e) { res.status(500).json({error:e.message}); }
+    } catch(e) { 
+        console.error(e);
+        res.status(500).json({success:false, msg: e.message}); 
+    }
 });
 
 // Admin Operations (Protected)
 
-// 上传支付二维码
+// 上传支付二维码 - 优化通知
 app.post('/api/admin/order/upload_qrcode', authAdmin, upload.single('qrcode'), async (req, res) => {
-    const { orderId } = req.body;
     try {
-        if (!req.file) return res.status(400).json({ error: 'No file uploaded or invalid type' });
-        const fileUrl = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
+        const { orderId, orderType = 'order' } = req.body;
         
-        await pool.query("UPDATE orders SET qrcode_url = $1 WHERE order_id = $2", [fileUrl, orderId]);
+        if (!req.file) {
+            return res.status(400).json({ success: false, error: '没有上传文件' });
+        }
         
-        sendTG(`📱 **二维码已上传**\n订单编码: \`${orderId}\`\n用户可扫码支付`);
+        // 压缩图片
+        const compressedPath = await compressImage(req.file.path);
+        const fileUrl = `${req.protocol}://${req.get('host')}/uploads/${path.basename(compressedPath)}`;
+        
+        let tableName = 'orders';
+        if (orderType === 'recharge') {
+            tableName = 'recharge_orders';
+        }
+        
+        await pool.query(
+            `UPDATE ${tableName} SET qrcode_url = $1, notified_qrcode = false WHERE order_id = $2`,
+            [fileUrl, orderId]
+        );
+        
+        // 获取用户信息发送通知
+        if (orderType === 'order') {
+            const order = await pool.query(
+                "SELECT o.*, u.contact FROM orders o LEFT JOIN users u ON o.user_id = u.id WHERE o.order_id = $1",
+                [orderId]
+            );
+            if (order.rows.length > 0) {
+                const contact = order.rows[0].contact || '用户';
+                sendTG(`📱 **二维码已上传**\n订单编码: \`${orderId}\`\n用户: ${contact}\n用户可扫码支付`);
+            }
+        } else if (orderType === 'recharge') {
+            const recharge = await pool.query(
+                "SELECT r.*, u.contact FROM recharge_orders r LEFT JOIN users u ON r.user_id = u.id WHERE r.order_id = $1",
+                [orderId]
+            );
+            if (recharge.rows.length > 0) {
+                const contact = recharge.rows[0].contact || '用户';
+                sendTG(`📱 **充值二维码已上传**\n订单编码: \`${orderId}\`\n用户: ${contact}\n用户可扫码支付`);
+            }
+        }
         
         res.json({ success: true, qrcodeUrl: fileUrl });
-    } catch (e) { res.status(500).json({error: e.message}); }
+    } catch (e) { 
+        console.error("上传二维码错误:", e);
+        res.status(500).json({success: false, error: e.message}); 
+    }
+});
+
+// 检查需要通知的二维码
+app.get('/api/order/check_qrcode/:orderId', async (req, res) => {
+    try {
+        const order = await pool.query(
+            "SELECT qrcode_url, notified_qrcode FROM orders WHERE order_id = $1",
+            [req.params.orderId]
+        );
+        
+        if (order.rows.length === 0) {
+            return res.json({ success: false, msg: '订单不存在' });
+        }
+        
+        const hasQrcode = !!order.rows[0].qrcode_url;
+        const notified = order.rows[0].notified_qrcode;
+        
+        // 如果二维码存在且未通知过，标记为已通知
+        if (hasQrcode && !notified) {
+            await pool.query(
+                "UPDATE orders SET notified_qrcode = true WHERE order_id = $1",
+                [req.params.orderId]
+            );
+        }
+        
+        res.json({ 
+            success: true, 
+            hasQrcode, 
+            qrcodeUrl: order.rows[0].qrcode_url,
+            needsNotification: hasQrcode && !notified
+        });
+    } catch (e) {
+        console.error('检查二维码错误:', e);
+        res.status(500).json({ success: false, msg: '检查二维码失败' });
+    }
+});
+
+// 检查充值订单二维码
+app.get('/api/recharge/check_qrcode/:orderId', async (req, res) => {
+    try {
+        const recharge = await pool.query(
+            "SELECT qrcode_url, notified_qrcode FROM recharge_orders WHERE order_id = $1",
+            [req.params.orderId]
+        );
+        
+        if (recharge.rows.length === 0) {
+            return res.json({ success: false, msg: '订单不存在' });
+        }
+        
+        const hasQrcode = !!recharge.rows[0].qrcode_url;
+        const notified = recharge.rows[0].notified_qrcode;
+        
+        // 如果二维码存在且未通知过，标记为已通知
+        if (hasQrcode && !notified) {
+            await pool.query(
+                "UPDATE recharge_orders SET notified_qrcode = true WHERE order_id = $1",
+                [req.params.orderId]
+            );
+        }
+        
+        res.json({ 
+            success: true, 
+            hasQrcode, 
+            qrcodeUrl: recharge.rows[0].qrcode_url,
+            needsNotification: hasQrcode && !notified
+        });
+    } catch (e) {
+        console.error('检查充值二维码错误:', e);
+        res.status(500).json({ success: false, msg: '检查充值二维码失败' });
+    }
 });
 
 app.post('/api/admin/order/ship', authAdmin, async (req, res) => {
@@ -712,15 +1080,22 @@ app.post('/api/admin/order/ship', authAdmin, async (req, res) => {
     try {
         await pool.query("UPDATE orders SET tracking_number = $1 WHERE order_id = $2", [trackingNumber, orderId]);
         res.json({ success: true });
-    } catch (e) { res.status(500).json({error: e.message}); }
+    } catch (e) { 
+        console.error(e);
+        res.status(500).json({success: false, error: e.message}); 
+    }
 });
 
 app.post('/api/admin/update/hiring', authAdmin, async (req, res) => {
     try { 
         const val = typeof req.body === 'string' ? req.body : JSON.stringify(req.body);
         await pool.query("INSERT INTO settings (key, value) VALUES ('hiring', $1) ON CONFLICT (key) DO UPDATE SET value = $1", [val]); 
+        cache.publicData = null; // 清除缓存
         res.json({ success: true }); 
-    } catch (e) { res.status(500).json({error: e.message}); }
+    } catch (e) { 
+        console.error(e);
+        res.status(500).json({success: false, error: e.message}); 
+    }
 });
 
 app.post('/api/admin/confirm_pay', authAdmin, async (req, res) => {
@@ -728,18 +1103,32 @@ app.post('/api/admin/confirm_pay', authAdmin, async (req, res) => {
     try {
         await pool.query("UPDATE orders SET status = '已支付' WHERE order_id = $1", [orderId]);
         res.json({ success: true });
-    } catch(e) { res.status(500).json({error: e.message}); }
+    } catch(e) { 
+        console.error(e);
+        res.status(500).json({success: false, error: e.message}); 
+    }
 });
 
 app.post('/api/admin/update/popup', authAdmin, async (req, res) => {
     try {
         await pool.query("INSERT INTO settings (key, value) VALUES ('announcement_popup', $1) ON CONFLICT (key) DO UPDATE SET value = $1", [req.body.open ? 'true':'false']);
+        cache.publicData = null; // 清除缓存
         res.json({ success: true });
-    } catch(e) { res.status(500).json({error: e.message}); }
+    } catch(e) { 
+        console.error(e);
+        res.status(500).json({success: false, error: e.message}); 
+    }
 });
 
 app.post('/api/admin/update/announcement', authAdmin, async (req, res) => {
-    try { await pool.query("UPDATE settings SET value = $1 WHERE key = 'announcement'", [req.body.text]); res.json({ success: true }); } catch (e) { res.status(500).json({error: e.message}); }
+    try { 
+        await pool.query("UPDATE settings SET value = $1 WHERE key = 'announcement'", [req.body.text]); 
+        cache.publicData = null; // 清除缓存
+        res.json({ success: true }); 
+    } catch (e) { 
+        console.error(e);
+        res.status(500).json({success: false, error: e.message}); 
+    }
 });
 
 // Create Product
@@ -748,8 +1137,12 @@ app.post('/api/admin/product', authAdmin, async (req, res) => {
     try {
         await pool.query('INSERT INTO products (name, price, stock, category, description, type, image_url) VALUES ($1, $2, $3, $4, $5, $6, $7)', 
             [name, price, stock, category, desc, type, imageUrl]);
+        cache.publicData = null; // 清除缓存
         res.json({ success: true });
-    } catch (e) { res.status(500).json({error: e.message}); }
+    } catch (e) { 
+        console.error(e);
+        res.status(500).json({success: false, error: e.message}); 
+    }
 });
 
 // Edit Product
@@ -758,16 +1151,24 @@ app.put('/api/admin/product/:id', authAdmin, async (req, res) => {
     try {
         await pool.query('UPDATE products SET name=$1, price=$2, stock=$3, category=$4, description=$5, type=$6, image_url=$7 WHERE id=$8', 
             [name, price, stock, category, desc, type, imageUrl, req.params.id]);
+        cache.publicData = null; // 清除缓存
         res.json({ success: true });
-    } catch (e) { res.status(500).json({error: e.message}); }
+    } catch (e) { 
+        console.error(e);
+        res.status(500).json({success: false, error: e.message}); 
+    }
 });
 
 // Delete Product
 app.delete('/api/admin/product/:id', authAdmin, async (req, res) => {
     try {
         await pool.query('DELETE FROM products WHERE id=$1', [req.params.id]);
+        cache.publicData = null; // 清除缓存
         res.json({ success: true });
-    } catch (e) { res.status(500).json({error: e.message}); }
+    } catch (e) { 
+        console.error(e);
+        res.status(500).json({success: false, error: e.message}); 
+    }
 });
 
 // Pin Product
@@ -777,8 +1178,25 @@ app.post('/api/admin/product/pin/:id', authAdmin, async (req, res) => {
         const curr = await pool.query('SELECT is_pinned FROM products WHERE id=$1', [req.params.id]);
         const newVal = !curr.rows[0].is_pinned;
         await pool.query('UPDATE products SET is_pinned=$1 WHERE id=$2', [newVal, req.params.id]);
+        cache.publicData = null; // 清除缓存
         res.json({ success: true });
-    } catch (e) { res.status(500).json({error: e.message}); }
+    } catch (e) { 
+        console.error(e);
+        res.status(500).json({success: false, error: e.message}); 
+    }
+});
+
+// 获取所有用户（管理员）
+app.get('/api/admin/users', authAdmin, async (req, res) => {
+    try {
+        const users = await pool.query(
+            'SELECT id, contact, display_name, balance, created_at FROM users ORDER BY created_at DESC'
+        );
+        res.json({ success: true, users: users.rows });
+    } catch (e) {
+        console.error('获取用户列表错误:', e);
+        res.status(500).json({ success: false, error: e.message });
+    }
 });
 
 // Chat & Admin Data
@@ -788,36 +1206,55 @@ app.post('/api/chat/send', async (req, res) => {
         await pool.query('INSERT INTO messages (session_id, sender, content) VALUES ($1, $2, $3)', [sessionId, 'user', text]);
         sendTG(`💬 **客户消息**\nID: \`${sessionId}\`\n内容: ${text}`);
         res.json({ success: true });
-    } catch (e) { res.status(500).json({error: e.message}); }
+    } catch (e) { 
+        console.error(e);
+        res.status(500).json({success: false, error: e.message}); 
+    }
 });
+
 app.get('/api/chat/history/:sid', async (req, res) => {
     try {
         const r = await pool.query('SELECT * FROM messages WHERE session_id = $1 ORDER BY created_at ASC', [req.params.sid]);
         res.json(r.rows);
-    } catch (e) { res.status(500).json({error: e.message}); }
+    } catch (e) { 
+        console.error(e);
+        res.status(500).json({success: false, error: e.message}); 
+    }
 });
+
 app.post('/api/admin/reply', authAdmin, async (req, res) => {
     const { sessionId, text } = req.body;
-    try { await pool.query('INSERT INTO messages (session_id, sender, content) VALUES ($1, $2, $3)', [sessionId, 'admin', text]); res.json({ success: true }); } catch (e) { res.status(500).json({error: e.message}); }
+    try { 
+        await pool.query('INSERT INTO messages (session_id, sender, content) VALUES ($1, $2, $3)', [sessionId, 'admin', text]); 
+        res.json({ success: true }); 
+    } catch (e) { 
+        console.error(e);
+        res.status(500).json({success: false, error: e.message}); 
+    }
 });
 
 app.get('/api/order/:id', async (req, res) => {
     try {
         const r = await pool.query('SELECT * FROM orders WHERE order_id = $1', [req.params.id]);
-        res.json(r.rows.length > 0 ? r.rows[0] : { status: '未找到' }); // This line seems unused by frontend poll but kept for compatibility
-    } catch (e) { res.status(500).json({error: e.message}); }
+        res.json(r.rows.length > 0 ? r.rows[0] : { status: '未找到' });
+    } catch (e) { 
+        console.error(e);
+        res.status(500).json({success: false, error: e.message}); 
+    }
 });
 
 // Get User Orders
 app.get('/api/order', async (req, res) => {
     try {
         if (req.query.userId) {
-            // Updated: filter by userId specifically
             const list = await pool.query('SELECT * FROM orders WHERE user_id = $1 ORDER BY created_at DESC', [req.query.userId]);
             return res.json(list.rows);
         }
         res.json([]);
-    } catch (e) { res.status(500).json({error: e.message}); }
+    } catch (e) { 
+        console.error(e);
+        res.status(500).json({success: false, error: e.message}); 
+    }
 });
 
 // Admin All Data (Protected)
@@ -825,8 +1262,8 @@ app.get('/api/admin/all', authAdmin, async (req, res) => {
     try {
         const orders = await pool.query('SELECT * FROM orders ORDER BY created_at DESC');
         const msgs = await pool.query('SELECT * FROM messages ORDER BY created_at ASC');
-        // Return products for management list as well
         const products = await pool.query('SELECT * FROM products ORDER BY is_pinned DESC, id DESC');
+        const users = await pool.query('SELECT id, contact, display_name, balance, created_at FROM users ORDER BY created_at DESC');
         
         const a = await pool.query("SELECT value FROM settings WHERE key = 'announcement'");
         const h = await pool.query("SELECT value FROM settings WHERE key = 'hiring'");
@@ -842,7 +1279,8 @@ app.get('/api/admin/all', authAdmin, async (req, res) => {
 
         res.json({
             orders: orders.rows,
-            products: products.rows, // Added products
+            products: products.rows,
+            users: users.rows, // 添加用户列表
             chats: chats,
             announcement: a.rows[0]?.value || '',
             hiring: JSON.parse(h.rows[0]?.value || '[]'),
@@ -850,7 +1288,21 @@ app.get('/api/admin/all', authAdmin, async (req, res) => {
             feeRate: f.rows[0]?.value || '0',
             popup: p.rows[0]?.value === 'true'
         });
-    } catch (e) { res.status(500).json({error: e.message}); }
+    } catch (e) { 
+        console.error(e);
+        res.status(500).json({success: false, error: e.message}); 
+    }
+});
+
+// 404处理
+app.use((req, res) => {
+    res.status(404).json({ success: false, error: 'API未找到' });
+});
+
+// 错误处理
+app.use((err, req, res, next) => {
+    console.error('服务器错误:', err);
+    res.status(500).json({ success: false, error: '服务器内部错误' });
 });
 
 app.listen(PORT, () => console.log(`Server running on ${PORT}`));
