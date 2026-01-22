@@ -11,8 +11,9 @@ const fs = require('fs');
 const bcrypt = require('bcryptjs');
 const rateLimit = require('express-rate-limit');
 const sharp = require('sharp');
-
 const app = express();
+
+app.set('trust proxy', 1);
 app.use(cors());
 app.use(bodyParser.json({ limit: '10mb' }));
 app.use(bodyParser.urlencoded({ extended: true, limit: '10mb' }));
