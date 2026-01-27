@@ -262,18 +262,17 @@ bot.on('message', async (msg) => {
 // ==========================================
 // 🌐 服务器配置
 // ==========================================
+
 app.use(cors());
-app.use(bodyParser.json());
+app.use(bodyParser.json({ limit: '10mb' }));
+app.use(bodyParser.urlencoded({ limit: '10mb', extended: true }));
 app.use(express.static('public'));
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 if (!fs.existsSync('uploads')) fs.mkdirSync('uploads');
 
 const upload = multer({ 
-    storage: multer.diskStorage({
-        destination: (req, file, cb) => cb(null, 'uploads/'),
-        filename: (req, file, cb) => cb(null, Date.now() + path.extname(file.originalname))
-    })
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 5 * 1024 * 1024 }
 });
 
 const adminAuth = (req, res, next) => {
@@ -551,8 +550,13 @@ app.post('/api/admin/reply', adminAuth, async (req, res) => {
 });
 
 app.post('/api/upload', adminAuth, upload.single('file'), (req, res) => {
-    if(req.file) res.json({success:true, url: `/uploads/${req.file.filename}`});
-    else res.json({success:false, error:'No file'});
+    if (req.file) {
+        const b64 = Buffer.from(req.file.buffer).toString('base64');
+        const dataURI = `data:${req.file.mimetype};base64,${b64}`;
+        res.json({ success: true, url: dataURI });
+    } else {
+        res.json({ success: false, error: 'No file' });
+    }
 });
 
 app.post('/api/admin/order/ship', adminAuth, (req, res) => {
@@ -566,8 +570,9 @@ app.post('/api/admin/order/ship', adminAuth, (req, res) => {
 app.post('/api/admin/order/upload_qrcode', adminAuth, upload.single('qrcode'), (req, res) => {
     const { orderId } = req.body;
     if(req.file) {
-        const url = `/uploads/${req.file.filename}`;
-        pool.query("UPDATE orders SET qrcode_url = $1 WHERE order_id = $2", [url, orderId]);
+        const b64 = Buffer.from(req.file.buffer).toString('base64');
+        const dataURI = `data:${req.file.mimetype};base64,${b64}`;
+        pool.query("UPDATE orders SET qrcode_url = $1 WHERE order_id = $2", [dataURI, orderId]);
         sendTgNotify(`✅ <b>收款码已上传</b>\n单号: <code>${orderId}</code>`);
         res.json({success:true});
     } else res.json({success:false});
