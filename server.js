@@ -1,482 +1,529 @@
-/**
- * NexGen Backend - High Performance, Secure, Single File Implementation
- * Stack: Express, PostgreSQL (Neon), Telegraf, Node-Cron
- */
-
-require('dotenv').config();
 const express = require('express');
-const { Pool } = require('pg');
-const { Telegraf } = require('telegraf');
 const cors = require('cors');
-const helmet = require('helmet');
-const morgan = require('morgan');
-const jwt = require('jsonwebtoken');
-const cron = require('node-cron');
-const { v4: uuidv4 } = require('uuid');
-const multer = require('multer'); // Used for memory storage of uploads
-const bcrypt = require('bcryptjs');
+const bodyParser = require('body-parser');
+const multer = require('multer');
+const TelegramBot = require('node-telegram-bot-api');
+const path = require('path');
+const fs = require('fs');
+const { Pool } = require('pg'); // 引入 Postgres 客户端
 
-// --- 配置检查 ---
-const requiredEnv = ['DATABASE_URL', 'TG_BOT_TOKEN', 'TG_GROUP_ID', 'JWT_SECRET'];
-const missingEnv = requiredEnv.filter(key => !process.env[key]);
-if (missingEnv.length > 0) {
-    console.error(`❌ 缺少环境变量: ${missingEnv.join(', ')}`);
-    // 为了防止部署失败，这里不退出进程，但 API 会报错
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// ==========================================
+// 🔑 环境变量 (Render 配置)
+// ==========================================
+const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN; 
+const TG_ADMIN_GROUP_ID = process.env.TG_ADMIN_GROUP_ID; 
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN;
+const DATABASE_URL = process.env.DATABASE_URL; // Neon 的连接字符串
+
+// 检查配置
+if (!TG_BOT_TOKEN || !TG_ADMIN_GROUP_ID || !ADMIN_TOKEN || !DATABASE_URL) {
+    console.error("❌ 错误: 环境变量缺失。请检查 TG_BOT_TOKEN, TG_ADMIN_GROUP_ID, ADMIN_TOKEN, DATABASE_URL");
+    process.exit(1);
 }
 
-// --- 初始化组件 ---
-const app = express();
-const upload = multer({ 
-    limits: { fileSize: 2 * 1024 * 1024 }, // 限制 2MB
-    fileFilter: (req, file, cb) => {
-        if (!file.mimetype.startsWith('image/')) return cb(new Error('只允许上传图片'));
-        cb(null, true);
+// ==========================================
+// 🐘 PostgreSQL 连接池 (Neon)
+// ==========================================
+const pool = new Pool({
+    connectionString: DATABASE_URL,
+    ssl: {
+        rejectUnauthorized: false // Neon 需要 SSL
     }
 });
-const bot = new Telegraf(process.env.TG_BOT_TOKEN);
-const pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: { rejectUnauthorized: false } // Neon 需要 SSL
-});
 
-// --- 全局变量与缓存 (Settings) ---
-let SYSTEM_CONFIG = {
-    exchangeRate: 7.20,
-    fees: { wx: 0.03, ali: 0.03 }
-};
-
-// --- 1. 数据库初始化 (自动建表) ---
+// 初始化数据库表结构
 const initDB = async () => {
-    const client = await pool.connect();
     try {
-        // 用户表
+        const client = await pool.connect();
+        
+        // 1. 用户表
         await client.query(`
             CREATE TABLE IF NOT EXISTS users (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                username VARCHAR(50) UNIQUE NOT NULL,
-                password VARCHAR(100) NOT NULL,
-                balance DECIMAL(10, 2) DEFAULT 0.00,
+                id BIGINT PRIMARY KEY,
+                contact TEXT UNIQUE NOT NULL,
+                password TEXT NOT NULL,
+                balance NUMERIC(10, 4) DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         `);
-        // 商品表
+
+        // 2. 商品表
         await client.query(`
             CREATE TABLE IF NOT EXISTS products (
-                id SERIAL PRIMARY KEY,
-                name VARCHAR(100) NOT NULL,
-                price DECIMAL(10, 2) NOT NULL,
-                stock INTEGER DEFAULT 0,
-                type VARCHAR(20) CHECK (type IN ('real', 'virtual')),
+                id BIGINT PRIMARY KEY,
+                name TEXT NOT NULL,
+                price NUMERIC(10, 2) NOT NULL,
+                stock INT DEFAULT 0,
+                category TEXT,
+                type TEXT,
+                description TEXT,
                 image_url TEXT,
-                is_top BOOLEAN DEFAULT FALSE,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                is_pinned BOOLEAN DEFAULT FALSE
             );
         `);
-        // 订单表 (包含支付凭证和二维码，使用 Text 存储 Base64 或 URL)
+
+        // 3. 订单表
         await client.query(`
             CREATE TABLE IF NOT EXISTS orders (
-                id VARCHAR(50) PRIMARY KEY,
-                user_id UUID REFERENCES users(id),
-                items JSONB NOT NULL,
-                total_amount DECIMAL(10, 2) NOT NULL,
-                pay_type VARCHAR(20) NOT NULL,
-                status VARCHAR(20) DEFAULT 'pending', 
-                qr_code TEXT, -- 管理员上传的收款码 (Base64)
-                payment_proof TEXT, -- 用户上传的凭证 (Base64)
-                expire_at TIMESTAMP,
+                order_id TEXT PRIMARY KEY,
+                user_id BIGINT,
+                product_name TEXT,
+                payment_method TEXT,
+                usdt_amount NUMERIC(10, 4),
+                cny_amount NUMERIC(10, 2),
+                status TEXT DEFAULT '待支付',
+                shipping_info TEXT,
+                tracking_number TEXT,
+                qrcode_url TEXT,
+                proof TEXT,
+                wallet TEXT,
+                expires_at TIMESTAMP,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         `);
-        // 招聘/公告表
+
+        // 4. 招聘表
         await client.query(`
-            CREATE TABLE IF NOT EXISTS announcements (
+            CREATE TABLE IF NOT EXISTS hiring (
                 id SERIAL PRIMARY KEY,
-                content TEXT NOT NULL,
-                is_popup BOOLEAN DEFAULT FALSE,
-                type VARCHAR(20) DEFAULT 'notice', -- notice, job
+                title TEXT,
+                content TEXT,
+                contact TEXT
+            );
+        `);
+
+        // 5. 聊天记录表
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS chats (
+                id SERIAL PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                sender TEXT,
+                content TEXT,
+                is_read BOOLEAN DEFAULT FALSE,
+                is_initiate BOOLEAN DEFAULT FALSE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         `);
-        console.log('✅ 数据库初始化完成 (Neon PostgreSQL)');
-    } catch (err) {
-        console.error('❌ 数据库初始化失败:', err);
-    } finally {
-        client.release();
-    }
-};
 
-// --- 2. 中间件与安全性 ---
-app.use(helmet()); // 设置安全 HTTP 头
-app.use(cors()); // 允许跨域 (生产环境应限制域名)
-app.use(express.json({ limit: '10mb' })); // 允许 JSON Body
-app.use(morgan('tiny')); // 日志
-
-// 鉴权中间件
-const authenticate = (req, res, next) => {
-    const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1];
-    if (!token) return res.status(401).json({ error: '未授权访问' });
-
-    jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
-        if (err) return res.status(403).json({ error: 'Token 无效或已过期' });
-        req.user = user;
-        next();
-    });
-};
-
-// --- 3. 业务 API 接口 ---
-
-// >>> 公开接口 <<<
-
-// 获取全局配置 (汇率等)
-app.get('/api/config', (req, res) => {
-    res.json(SYSTEM_CONFIG);
-});
-
-// 获取商品列表
-app.get('/api/products', async (req, res) => {
-    try {
-        const result = await pool.query('SELECT * FROM products ORDER BY is_top DESC, id DESC');
-        // 前端显示时自动换算汇率，后端只发 USDT 价格
-        res.json(result.rows);
-    } catch (err) {
-        res.status(500).json({ error: 'Database error' });
-    }
-});
-
-// 注册
-app.post('/api/auth/register', async (req, res) => {
-    const { username, password } = req.body;
-    if (!username || !password) return res.status(400).json({ error: '参数不完整' });
-    
-    // 简单的防止暴力破解 (生产环境应加 Rate Limit)
-    if (password.length < 6) return res.status(400).json({ error: '密码过短' });
-
-    const hashedPassword = await bcrypt.hash(password, 10);
-    try {
-        const result = await pool.query(
-            'INSERT INTO users (username, password) VALUES ($1, $2) RETURNING id, username, balance',
-            [username, hashedPassword]
-        );
-        const user = result.rows[0];
-        const token = jwt.sign({ id: user.id, username: user.username }, process.env.JWT_SECRET, { expiresIn: '24h' });
-        res.json({ token, user });
-    } catch (err) {
-        if (err.code === '23505') return res.status(400).json({ error: '用户名已存在' });
-        res.status(500).json({ error: '注册失败' });
-    }
-});
-
-// 登录
-app.post('/api/auth/login', async (req, res) => {
-    const { username, password } = req.body;
-    try {
-        const result = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
-        if (result.rows.length === 0) return res.status(400).json({ error: '用户不存在' });
-
-        const user = result.rows[0];
-        const valid = await bcrypt.compare(password, user.password);
-        if (!valid) return res.status(400).json({ error: '密码错误' });
-
-        const token = jwt.sign({ id: user.id, username: user.username }, process.env.JWT_SECRET, { expiresIn: '24h' });
-        res.json({ token, user: { id: user.id, username: user.username, balance: user.balance } });
-    } catch (err) {
-        res.status(500).json({ error: '登录失败' });
-    }
-});
-
-// >>> 需登录接口 <<<
-
-// 创建订单 (核心安全逻辑)
-app.post('/api/orders', authenticate, async (req, res) => {
-    const { items, payType, useBalance } = req.body; 
-    // items: [{id, qty}, ...]
-    
-    if (!items || items.length === 0) return res.status(400).json({ error: '购物车为空' });
-
-    const client = await pool.connect();
-    try {
-        await client.query('BEGIN'); // 开启事务
-
-        let subtotal = 0;
-        const dbItems = [];
-
-        // 1. 验证商品价格与库存 (后端计算，不信前端)
-        for (const item of items) {
-            const prodRes = await client.query('SELECT * FROM products WHERE id = $1', [item.id]);
-            if (prodRes.rows.length === 0) throw new Error(`商品 ID ${item.id} 不存在`);
-            const prod = prodRes.rows[0];
-            
-            if (prod.stock < item.qty) throw new Error(`商品 ${prod.name} 库存不足`);
-            
-            // 扣减库存
-            await client.query('UPDATE products SET stock = stock - $1 WHERE id = $2', [item.qty, item.id]);
-            
-            subtotal += parseFloat(prod.price) * item.qty;
-            dbItems.push({ id: prod.id, name: prod.name, price: prod.price, qty: item.qty });
-        }
-
-        // 2. 计算费用
-        let feeRate = 0;
-        if (payType === 'wechat') feeRate = SYSTEM_CONFIG.fees.wx;
-        if (payType === 'alipay') feeRate = SYSTEM_CONFIG.fees.ali;
-        
-        let totalAmount = subtotal * (1 + feeRate);
-
-        // 3. 余额抵扣逻辑
-        let balanceUsed = 0;
-        if (useBalance) {
-            const userRes = await client.query('SELECT balance FROM users WHERE id = $1', [req.user.id]);
-            const userBalance = parseFloat(userRes.rows[0].balance);
-            
-            if (userBalance >= totalAmount) {
-                balanceUsed = totalAmount;
-                totalAmount = 0; // 全额抵扣
-            } else {
-                balanceUsed = userBalance;
-                totalAmount -= userBalance;
-            }
-            
-            // 扣除余额
-            if (balanceUsed > 0) {
-                await client.query('UPDATE users SET balance = balance - $1 WHERE id = $2', [balanceUsed, req.user.id]);
-            }
-        }
-
-        // 4. USDT 随机小数逻辑
-        if (payType === 'usdt' && totalAmount > 0) {
-            const randomDecimal = (Math.floor(Math.random() * 99) + 1) / 100;
-            totalAmount += randomDecimal;
-            totalAmount = parseFloat(totalAmount.toFixed(2));
-        }
-
-        // 5. 生成订单
-        const orderId = uuidv4().split('-')[0].toUpperCase(); // 生成短订单号
-        const expireAt = new Date(Date.now() + 30 * 60000); // 30分钟后过期
-
-        // 状态: 如果全额余额支付，直接 paid，否则 pending
-        const status = totalAmount <= 0.01 ? 'paid' : 'pending';
-
-        await client.query(
-            `INSERT INTO orders (id, user_id, items, total_amount, pay_type, status, expire_at) 
-             VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-            [orderId, req.user.id, JSON.stringify(dbItems), totalAmount, payType, status, expireAt]
-        );
-
-        await client.query('COMMIT');
-
-        // TG 通知
-        notifyGroup(`📦 <b>新订单创建</b>\n订单号: <code>${orderId}</code>\n用户: ${req.user.username}\n金额: ${totalAmount} ${payType.toUpperCase()}\n状态: ${status}`);
-
-        res.json({ orderId, totalAmount, status, expireAt });
-
-    } catch (err) {
-        await client.query('ROLLBACK');
-        res.status(400).json({ error: err.message || '订单创建失败' });
-    } finally {
-        client.release();
-    }
-});
-
-// 获取我的订单
-app.get('/api/orders/my', authenticate, async (req, res) => {
-    const result = await pool.query('SELECT * FROM orders WHERE user_id = $1 ORDER BY created_at DESC', [req.user.id]);
-    // 安全策略: 只有 pending 且非 USDT 的订单才返回 qr_code (如果是 Base64 图片)
-    // 这里为了简化，直接返回，前端负责展示逻辑
-    res.json(result.rows);
-});
-
-// 上传支付凭证
-app.post('/api/orders/:id/proof', authenticate, upload.single('proof'), async (req, res) => {
-    const orderId = req.params.id;
-    const file = req.file; // 内存中的文件
-    if (!file) return res.status(400).json({ error: '未上传文件' });
-
-    // 将图片转为 Base64 存入 DB (适应无文件系统环境)
-    const base64Img = `data:${file.mimetype};base64,${file.buffer.toString('base64')}`;
-
-    try {
-        await pool.query('UPDATE orders SET payment_proof = $1 WHERE id = $2 AND user_id = $3', [base64Img, orderId, req.user.id]);
-        notifyGroup(`📸 <b>收到支付凭证</b>\n订单号: <code>${orderId}</code>\n请管理员尽快审核。`);
-        res.json({ success: true });
-    } catch (err) {
-        res.status(500).json({ error: '上传失败' });
-    }
-});
-
-// >>> 管理员接口 (需要单独的 Admin Key header 或特殊 Token, 这里简化用特殊 Header) <<<
-const adminAuth = (req, res, next) => {
-    const key = req.headers['x-admin-key'];
-    if (key !== process.env.ADMIN_KEY) return res.status(403).json({ error: '管理员权限验证失败' });
-    next();
-};
-
-// 管理员：获取所有订单
-app.get('/api/admin/orders', adminAuth, async (req, res) => {
-    const result = await pool.query(`
-        SELECT orders.*, users.username 
-        FROM orders 
-        LEFT JOIN users ON orders.user_id = users.id 
-        ORDER BY orders.created_at DESC
-    `);
-    res.json(result.rows);
-});
-
-// 管理员：上传收款码
-app.post('/api/admin/orders/:id/qr', adminAuth, upload.single('qr'), async (req, res) => {
-    const orderId = req.params.id;
-    const file = req.file;
-    if (!file) return res.status(400).json({ error: '未上传文件' });
-    
-    const base64Img = `data:${file.mimetype};base64,${file.buffer.toString('base64')}`;
-
-    try {
-        await pool.query('UPDATE orders SET qr_code = $1 WHERE id = $2', [base64Img, orderId]);
-        res.json({ success: true });
-    } catch (err) {
-        res.status(500).json({ error: '数据库错误' });
-    }
-});
-
-// 管理员：确认收款 (安全策略：立即删除二维码)
-app.post('/api/admin/orders/:id/confirm', adminAuth, async (req, res) => {
-    const orderId = req.params.id;
-    const client = await pool.connect();
-    try {
-        // 确认收款，清空 QR 码，清空凭证 (节省空间)
+        // 6. 系统设置表 (KV存储)
         await client.query(`
-            UPDATE orders 
-            SET status = 'paid', qr_code = NULL 
-            WHERE id = $1
-        `, [orderId]);
-        
-        notifyGroup(`✅ <b>订单已确认收款</b>\n订单号: <code>${orderId}</code>`);
-        res.json({ success: true });
-    } catch (err) {
-        res.status(500).json({ error: '操作失败' });
-    } finally {
-        client.release();
-    }
-});
-
-// 管理员：上架商品
-app.post('/api/admin/products', adminAuth, async (req, res) => {
-    const { name, price, stock, type, image_url } = req.body;
-    try {
-        await pool.query(
-            'INSERT INTO products (name, price, stock, type, image_url) VALUES ($1, $2, $3, $4, $5)',
-            [name, price, stock, type, image_url]
-        );
-        res.json({ success: true });
-    } catch (err) {
-        res.status(500).json({ error: '上架失败' });
-    }
-});
-
-// --- 4. 自动清理任务 (Cron) ---
-// 每天凌晨 3 点清理超过 3 天的订单和物流数据
-cron.schedule('0 3 * * *', async () => {
-    console.log('🧹 开始执行数据清理任务...');
-    try {
-        const res = await pool.query(`
-            DELETE FROM orders 
-            WHERE created_at < NOW() - INTERVAL '3 days'
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            );
         `);
-        console.log(`✅ 已清理 ${res.rowCount} 条过期订单数据`);
-    } catch (err) {
-        console.error('❌ 清理任务失败:', err);
-    }
-});
 
-// --- 5. Telegram 机器人逻辑 ---
-const notifyGroup = (htmlMsg) => {
-    if (process.env.TG_GROUP_ID) {
-        bot.telegram.sendMessage(process.env.TG_GROUP_ID, htmlMsg, { parse_mode: 'HTML' }).catch(e => console.error('TG 推送失败', e));
+        // 初始化默认设置
+        await client.query(`INSERT INTO settings (key, value) VALUES ('rate', '7.0') ON CONFLICT DO NOTHING;`);
+        await client.query(`INSERT INTO settings (key, value) VALUES ('feeRate', '0') ON CONFLICT DO NOTHING;`);
+        await client.query(`INSERT INTO settings (key, value) VALUES ('announcement', '欢迎来到小暗网') ON CONFLICT DO NOTHING;`);
+        await client.query(`INSERT INTO settings (key, value) VALUES ('popup', 'true') ON CONFLICT DO NOTHING;`);
+
+        console.log("✅ 数据库表结构初始化完成 (Neon)");
+        client.release();
+    } catch (err) {
+        console.error("❌ 数据库初始化失败:", err);
     }
 };
 
-// 仅在指定群组响应
-bot.use(async (ctx, next) => {
-    if (ctx.chat && String(ctx.chat.id) === process.env.TG_GROUP_ID) {
-        return next();
+initDB();
+
+// 辅助函数：获取设置
+const getSetting = async (key) => {
+    const res = await pool.query('SELECT value FROM settings WHERE key = $1', [key]);
+    return res.rows.length > 0 ? res.rows[0].value : null;
+};
+const setSetting = async (key, value) => {
+    await pool.query('INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = $2', [key, value.toString()]);
+};
+
+
+// ==========================================
+// 🤖 Telegram 机器人逻辑
+// ==========================================
+const bot = new TelegramBot(TG_BOT_TOKEN, { polling: true });
+
+const sendTgNotify = (text) => {
+    bot.sendMessage(TG_ADMIN_GROUP_ID, text, { parse_mode: 'HTML' }).catch(e => console.error("TG发送失败:", e.message));
+};
+
+bot.on('message', async (msg) => {
+    const chatId = msg.chat.id;
+    const type = msg.chat.type;
+    const text = msg.text ? msg.text.trim() : '';
+
+    if (type === 'private') return; // 私聊静默
+
+    if (chatId.toString() !== TG_ADMIN_GROUP_ID.toString()) {
+        bot.leaveChat(chatId).catch(()=>{});
+        return; 
     }
-    // 私聊直接忽略或回复无法使用
-    if (ctx.chat.type === 'private') {
-        // ctx.reply('⚠️ 此机器人仅供内部群组使用。');
+
+    // /bz 指令
+    if (text === '/bz' || text === '/help') {
+        const helpMsg = `
+<b>🤖 小暗网 控台指令手册 (Neon版)</b>
+
+1. <b>/ck</b> - 查看数据库统计
+2. <b>/qc</b> - ⚠️ 清空所有数据 (慎用)
+3. <b>设置汇率 [数字]</b> - 修改USDT汇率
+4. <b>设置手续费 [数字]</b> - 修改手续费%
+        `;
+        bot.sendMessage(chatId, helpMsg, { parse_mode: 'HTML' });
+    }
+
+    // /ck 指令
+    else if (text === '/ck') {
+        try {
+            const userCount = (await pool.query('SELECT COUNT(*) FROM users')).rows[0].count;
+            const orderCount = (await pool.query('SELECT COUNT(*) FROM orders')).rows[0].count;
+            const prodCount = (await pool.query('SELECT COUNT(*) FROM products')).rows[0].count;
+            const rate = await getSetting('rate');
+            const fee = await getSetting('feeRate');
+
+            const stats = `
+<b>📊 小暗网 数据库统计</b>
+━━━━━━━━━━━━━━
+👤 用户总数: ${userCount}
+📦 订单总数: ${orderCount}
+🛒 商品总数: ${prodCount}
+💰 当前汇率: ${rate}
+💸 手续费率: ${fee}%
+            `;
+            bot.sendMessage(chatId, stats, { parse_mode: 'HTML' });
+        } catch (e) {
+            bot.sendMessage(chatId, "❌ 读取数据库失败: " + e.message);
+        }
+    }
+
+    // /qc 指令
+    else if (text === '/qc') {
+        try {
+            await pool.query('TRUNCATE users, orders, chats');
+            bot.sendMessage(chatId, "🗑️ <b>用户、订单、聊天记录已清空！</b>", { parse_mode: 'HTML' });
+        } catch(e) {
+            bot.sendMessage(chatId, "❌ 清空失败");
+        }
+    }
+
+    // 设置汇率
+    else if (text.startsWith('设置汇率 ')) {
+        const rate = parseFloat(text.split(' ')[1]);
+        if (!isNaN(rate)) {
+            await setSetting('rate', rate);
+            bot.sendMessage(chatId, `✅ <b>汇率已更新</b>: ${rate}`, { parse_mode: 'HTML' });
+        }
+    }
+
+    // 设置手续费
+    else if (text.startsWith('设置手续费 ')) {
+        const fee = parseFloat(text.split(' ')[1]);
+        if (!isNaN(fee)) {
+            await setSetting('feeRate', fee);
+            bot.sendMessage(chatId, `✅ <b>手续费已更新</b>: ${fee}%`, { parse_mode: 'HTML' });
+        }
     }
 });
 
-// 指令: 查看概况
-bot.command('ck', async (ctx) => {
+
+// ==========================================
+// 🌐 Express 配置
+// ==========================================
+app.use(cors());
+app.use(bodyParser.json());
+app.use(express.static('public'));
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+
+if (!fs.existsSync('uploads')) fs.mkdirSync('uploads');
+
+const storage = multer.diskStorage({
+    destination: (req, file, cb) => cb(null, 'uploads/'),
+    filename: (req, file, cb) => cb(null, Date.now() + path.extname(file.originalname))
+});
+const upload = multer({ storage });
+const adminAuth = (req, res, next) => {
+    if(req.headers['authorization'] === ADMIN_TOKEN) next();
+    else res.status(401).json({msg:'Unauthorized'});
+};
+
+
+// ==========================================
+// 🛒 API 路由 (已适配 Postgres)
+// ==========================================
+
+// 1. 公共数据
+app.get('/api/public/data', async (req, res) => {
     try {
-        const orderCount = (await pool.query("SELECT COUNT(*) FROM orders WHERE created_at > CURRENT_DATE")).rows[0].count;
-        const revenue = (await pool.query("SELECT SUM(total_amount) FROM orders WHERE status = 'paid' AND created_at > CURRENT_DATE")).rows[0].sum || 0;
+        const prods = await pool.query('SELECT * FROM products WHERE stock > 0 OR is_pinned = TRUE ORDER BY is_pinned DESC, id DESC');
+        const hiring = await pool.query('SELECT * FROM hiring');
+        const rate = await getSetting('rate');
+        const feeRate = await getSetting('feeRate');
+        const ann = await getSetting('announcement');
+        const pop = await getSetting('popup');
+
+        const categories = [...new Set(prods.rows.map(p => p.category))];
+
+        res.json({
+            products: prods.rows,
+            categories,
+            hiring: hiring.rows,
+            rate: parseFloat(rate),
+            feeRate: parseFloat(feeRate),
+            announcement: ann,
+            showPopup: pop === 'true'
+        });
+    } catch(e) { console.error(e); res.status(500).json({error: e.message}); }
+});
+
+// 2. 注册
+app.post('/api/user/register', async (req, res) => {
+    const { contact, password, uid } = req.body;
+    try {
+        const check = await pool.query('SELECT id FROM users WHERE contact = $1', [contact]);
+        if(check.rows.length > 0) return res.json({success:false, msg:'用户已存在'});
+
+        const id = uid || Math.floor(100000 + Math.random() * 900000);
+        await pool.query('INSERT INTO users (id, contact, password, balance) VALUES ($1, $2, $3, 0)', [id, contact, password]);
         
-        ctx.replyWithHTML(
-            `📊 <b>今日概况</b>\n` +
-            `订单数: ${orderCount}\n` +
-            `今日营收: ${revenue} USDT\n` +
-            `当前汇率: ${SYSTEM_CONFIG.exchangeRate}\n` +
-            `WX费率: ${SYSTEM_CONFIG.fees.wx * 100}%`
-        );
-    } catch (e) {
-        ctx.reply('查询失败');
-    }
+        res.json({ success: true, isNew: true, userId: id, uid: id, balance: 0 });
+    } catch(e) { res.json({success:false, msg: e.message}); }
 });
 
-// 指令: 清空数据库 (危险)
-bot.command('qc', async (ctx) => {
-    // 实际项目中应加二次确认或仅允许 Owner
+// 3. 登录
+app.post('/api/user/login', async (req, res) => {
+    const { contact, password } = req.body;
     try {
-        await pool.query('TRUNCATE TABLE orders CASCADE');
-        ctx.reply('🗑️ 订单表已清空');
-    } catch (e) {
-        ctx.reply('操作失败');
-    }
+        const result = await pool.query('SELECT * FROM users WHERE contact = $1 AND password = $2', [contact, password]);
+        if(result.rows.length > 0) {
+            const u = result.rows[0];
+            res.json({ success: true, userId: u.id, uid: u.id, balance: parseFloat(u.balance) });
+        } else {
+            res.json({ success: false, msg: '账号或密码错误' });
+        }
+    } catch(e) { res.json({success:false, msg: e.message}); }
 });
 
-// 指令: 帮助
-bot.command('bz', (ctx) => {
-    ctx.reply(
-        '/ck - 查看今日数据\n' +
-        '/qc - 清空订单数据\n' +
-        '设置汇率 [数字] - 如: 设置汇率 7.3\n' +
-        '设置手续费 [数字] - 如: 设置手续费 5 (代表5%)'
-    );
+// 4. 获取余额
+app.get('/api/user/balance', async (req, res) => {
+    try {
+        const result = await pool.query('SELECT balance FROM users WHERE id = $1', [req.query.userId]);
+        if(result.rows.length > 0) res.json({ success: true, balance: parseFloat(result.rows[0].balance) });
+        else res.json({ success: false });
+    } catch(e) { res.json({success:false}); }
 });
 
-// 监听文本指令 (设置汇率/手续费)
-bot.on('text', (ctx) => {
-    const text = ctx.message.text;
+// 5. 修改密码
+app.post('/api/user/change-password', async (req, res) => {
+    const { userId, oldPassword, newPassword } = req.body;
+    try {
+        const user = await pool.query('SELECT password FROM users WHERE id = $1', [userId]);
+        if(user.rows.length === 0) return res.json({success:false, msg:'用户不存在'});
+        if(user.rows[0].password !== oldPassword) return res.json({success:false, msg:'旧密码错误'});
+
+        await pool.query('UPDATE users SET password = $1 WHERE id = $2', [newPassword, userId]);
+        res.json({success:true, msg:'修改成功'});
+    } catch(e) { res.json({success:false, msg: e.message}); }
+});
+
+// 6. 提交订单
+app.post('/api/order', async (req, res) => {
+    const { userId, productId, paymentMethod, shippingInfo, useBalance, balanceAmount } = req.body;
     
-    // 匹配 "设置汇率 7.2"
-    const rateMatch = text.match(/^设置汇率\s+(\d+(\.\d+)?)$/);
-    if (rateMatch) {
-        const newRate = parseFloat(rateMatch[1]);
-        SYSTEM_CONFIG.exchangeRate = newRate;
-        return ctx.reply(`✅ 汇率已更新为: ${newRate}`);
-    }
+    try {
+        const userRes = await pool.query('SELECT * FROM users WHERE id = $1', [userId]);
+        const user = userRes.rows[0];
+        
+        let prodName = "购物车商品";
+        let amount = 0;
 
-    // 匹配 "设置手续费 3"
-    const feeMatch = text.match(/^设置手续费\s+(\d+(\.\d+)?)$/);
-    if (feeMatch) {
-        const newFee = parseFloat(feeMatch[1]) / 100;
-        SYSTEM_CONFIG.fees.wx = newFee;
-        SYSTEM_CONFIG.fees.ali = newFee;
-        return ctx.reply(`✅ 手续费已更新为: ${feeMatch[1]}%`);
-    }
+        if (productId !== 'cart') {
+            const prodRes = await pool.query('SELECT * FROM products WHERE id = $1', [productId]);
+            const prod = prodRes.rows[0];
+            if(prod) {
+                prodName = prod.name;
+                amount = parseFloat(prod.price);
+                // 扣库存
+                await pool.query('UPDATE products SET stock = stock - 1 WHERE id = $1', [productId]);
+            }
+        } else {
+            amount = req.body.totalAmount || 10; 
+        }
+
+        let finalUSDT = amount;
+        if(useBalance && user && parseFloat(user.balance) > 0) {
+            const balance = parseFloat(user.balance);
+            const deduct = Math.min(balance, amount);
+            finalUSDT -= deduct;
+            // 扣余额
+            await pool.query('UPDATE users SET balance = balance - $1 WHERE id = $2', [deduct, userId]);
+        }
+
+        const rate = parseFloat(await getSetting('rate'));
+        const feeRate = parseFloat(await getSetting('feeRate'));
+        const cnyAmount = (finalUSDT * rate * (1 + feeRate/100)).toFixed(2);
+        
+        const orderId = 'ORD-' + Date.now();
+        const wallet = 'Txxxxxxxxxxxxxxxxxxxxxx'; // 收款地址
+
+        await pool.query(
+            `INSERT INTO orders (order_id, user_id, product_name, payment_method, usdt_amount, cny_amount, shipping_info, wallet, expires_at) 
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW() + INTERVAL '30 minutes')`,
+            [orderId, userId, prodName, paymentMethod, finalUSDT.toFixed(4), cnyAmount, JSON.stringify(shippingInfo), wallet]
+        );
+
+        // TG 推送
+        let tgMsg = `🆕 <b>新订单提醒</b>\n\n单号: <code>${orderId}</code>\n用户: ${user ? user.contact : userId}\n商品: ${prodName}\n支付: ${paymentMethod}\n金额: ${finalUSDT.toFixed(4)} USDT`;
+        if(paymentMethod !== 'USDT') tgMsg += `\n⚠️ <b>待收款</b>`;
+        sendTgNotify(tgMsg);
+
+        res.json({ success: true, orderId, usdtAmount: finalUSDT.toFixed(4), cnyAmount, wallet });
+
+    } catch(e) { console.error(e); res.json({success:false, msg: e.message}); }
 });
 
-// 启动机器人
-bot.launch().then(() => console.log('🤖 Telegram Bot 已启动')).catch(e => console.error('Bot 启动失败', e));
-
-// --- 6. 启动服务器 ---
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, async () => {
-    await initDB(); // 启动时尝试建表
-    console.log(`🚀 Server running on port ${PORT}`);
+// 7. 获取订单列表
+app.get('/api/order', async (req, res) => {
+    try {
+        const result = await pool.query('SELECT * FROM orders WHERE user_id = $1 ORDER BY created_at DESC', [req.query.userId]);
+        res.json(result.rows);
+    } catch(e) { res.json([]); }
 });
 
-// 优雅退出
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
+// 8. 确认支付凭证
+app.post('/api/order/confirm-payment', async (req, res) => {
+    const { orderId, proof } = req.body;
+    try {
+        await pool.query("UPDATE orders SET proof = $1, status = '待审核' WHERE order_id = $2", [proof, orderId]);
+        sendTgNotify(`📸 <b>支付凭证上传</b>\n单号: <code>${orderId}</code>\n请进后台审核。`);
+        res.json({success:true});
+    } catch(e) { res.json({success:false}); }
+});
+
+// 9. 二维码异常
+app.post('/api/order/report-qr-issue', async (req, res) => {
+    sendTgNotify(`🚨 <b>二维码异常</b>\n单号: <code>${req.body.orderId}</code>`);
+    res.json({success:true});
+});
+
+// 10. 聊天
+app.post('/api/chat/send', async (req, res) => {
+    const { sessionId, text } = req.body;
+    try {
+        await pool.query('INSERT INTO chats (session_id, sender, content) VALUES ($1, $2, $3)', [sessionId, 'user', text]);
+        sendTgNotify(`💬 <b>在线客服</b>\nID: ${sessionId}\n消息: ${text}`);
+        res.json({ success: true });
+    } catch(e) { res.json({success:false}); }
+});
+
+app.get('/api/chat/history/:sid', async (req, res) => {
+    try {
+        const result = await pool.query('SELECT * FROM chats WHERE session_id = $1 ORDER BY created_at ASC', [req.params.sid]);
+        res.json(result.rows);
+    } catch(e) { res.json([]); }
+});
+
+// ==========================================
+// 🔧 后台管理接口 (Admin)
+// ==========================================
+
+app.post('/api/admin/login', (req, res) => {
+    if(req.body.username === 'admin' && req.body.password === ADMIN_TOKEN) 
+        res.json({success:true, token: ADMIN_TOKEN});
+    else res.json({success:false, msg:'Error'});
+});
+
+app.get('/api/admin/all', adminAuth, async (req, res) => {
+    try {
+        const users = await pool.query('SELECT * FROM users ORDER BY created_at DESC');
+        const orders = await pool.query('SELECT * FROM orders ORDER BY created_at DESC');
+        const products = await pool.query('SELECT * FROM products ORDER BY id DESC');
+        const hiring = await pool.query('SELECT * FROM hiring');
+        
+        // 整理聊天记录
+        const chatsRes = await pool.query('SELECT * FROM chats ORDER BY created_at ASC');
+        let chats = {};
+        chatsRes.rows.forEach(msg => {
+            if(!chats[msg.session_id]) chats[msg.session_id] = [];
+            chats[msg.session_id].push(msg);
+        });
+
+        const rate = await getSetting('rate');
+        const feeRate = await getSetting('feeRate');
+        const announcement = await getSetting('announcement');
+        const popup = await getSetting('popup');
+
+        res.json({
+            users: users.rows,
+            orders: orders.rows,
+            products: products.rows,
+            hiring: hiring.rows,
+            chats,
+            rate,
+            feeRate,
+            announcement,
+            popup: popup === 'true'
+        });
+    } catch(e) { console.error(e); res.status(500).json({}); }
+});
+
+// 后台修改余额
+app.post('/api/admin/user/balance', adminAuth, async (req, res) => {
+    const { userId, amount, type } = req.body;
+    try {
+        const val = parseFloat(amount);
+        let sql = '';
+        if(type === 'add') sql = 'UPDATE users SET balance = balance + $1 WHERE id = $2';
+        if(type === 'subtract') sql = 'UPDATE users SET balance = GREATEST(0, balance - $1) WHERE id = $2';
+        if(type === 'set') sql = 'UPDATE users SET balance = $1 WHERE id = $2';
+        
+        await pool.query(sql, [val, userId]);
+        res.json({success:true});
+    } catch(e) { res.json({success:false}); }
+});
+
+// 后台发起聊天
+app.post('/api/admin/chat/initiate', adminAuth, async (req, res) => {
+    const sid = `user_${req.body.userId}`;
+    await pool.query("INSERT INTO chats (session_id, sender, content, is_initiate) VALUES ($1, 'admin', '客服已接入', TRUE)", [sid]);
+    res.json({success:true, sessionId: sid});
+});
+
+// 后台回复
+app.post('/api/admin/reply', adminAuth, async (req, res) => {
+    const { sessionId, text } = req.body;
+    await pool.query("INSERT INTO chats (session_id, sender, content) VALUES ($1, 'admin', $2)", [sessionId, text]);
+    res.json({success:true});
+});
+
+// 后台商品管理 (增删改)
+app.post('/api/admin/product', adminAuth, async (req, res) => {
+    const { name, price, stock, category, type, desc, imageUrl } = req.body;
+    const id = Date.now();
+    await pool.query(
+        'INSERT INTO products (id, name, price, stock, category, type, description, image_url) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)',
+        [id, name, price, stock, category, type, desc, imageUrl]
+    );
+    res.json({success:true});
+});
+
+app.put('/api/admin/product/:id', adminAuth, async (req, res) => {
+    const { name, price, stock, category, type, desc, imageUrl } = req.body;
+    await pool.query(
+        'UPDATE products SET name=$1, price=$2, stock=$3, category=$4, type=$5, description=$6, image_url=$7 WHERE id=$8',
+        [name, price, stock, category, type, desc, imageUrl, req.params.id]
+    );
+    res.json({success:true});
+});
+
+app.delete('/api/admin/product/:id', adminAuth, async (req, res) => {
+    await pool.query('DELETE FROM products WHERE id = $1', [req.params.id]);
+    res.json({success:true});
+});
+
+// 启动
+app.listen(PORT, () => {
+    console.log(`🚀 Server running on port ${PORT} (Neon DB)`);
+});
