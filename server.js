@@ -264,8 +264,8 @@ bot.on('message', async (msg) => {
 // ==========================================
 
 app.use(cors());
-app.use(bodyParser.json({ limit: '10mb' }));
-app.use(bodyParser.urlencoded({ limit: '10mb', extended: true }));
+app.use(bodyParser.json({ limit: '50mb' }));
+app.use(bodyParser.urlencoded({ limit: '50mb', extended: true }));
 app.use(express.static('public'));
 
 if (!fs.existsSync('uploads')) fs.mkdirSync('uploads');
