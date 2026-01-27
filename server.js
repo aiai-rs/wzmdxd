@@ -1,3 +1,7 @@
+/**
+ * NEXUS Backend - 最终完整版 (Neon PostgreSQL + TG Bot)
+ */
+
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
@@ -5,36 +9,34 @@ const multer = require('multer');
 const TelegramBot = require('node-telegram-bot-api');
 const path = require('path');
 const fs = require('fs');
-const { Pool } = require('pg'); // 引入 Postgres 客户端
+const { Pool } = require('pg'); // PostgreSQL 客户端
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ==========================================
-// 🔑 环境变量 (Render 配置)
+// 🔑 环境变量配置
 // ==========================================
 const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN; 
 const TG_ADMIN_GROUP_ID = process.env.TG_ADMIN_GROUP_ID; 
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN;
-const DATABASE_URL = process.env.DATABASE_URL; // Neon 的连接字符串
+const DATABASE_URL = process.env.DATABASE_URL;
 
-// 检查配置
+// 安全检查
 if (!TG_BOT_TOKEN || !TG_ADMIN_GROUP_ID || !ADMIN_TOKEN || !DATABASE_URL) {
     console.error("❌ 错误: 环境变量缺失。请检查 TG_BOT_TOKEN, TG_ADMIN_GROUP_ID, ADMIN_TOKEN, DATABASE_URL");
     process.exit(1);
 }
 
 // ==========================================
-// 🐘 PostgreSQL 连接池 (Neon)
+// 🐘 数据库连接 (Neon)
 // ==========================================
 const pool = new Pool({
     connectionString: DATABASE_URL,
-    ssl: {
-        rejectUnauthorized: false // Neon 需要 SSL
-    }
+    ssl: { rejectUnauthorized: false }
 });
 
-// 初始化数据库表结构
+// 初始化数据库表
 const initDB = async () => {
     try {
         const client = await pool.connect();
@@ -65,7 +67,7 @@ const initDB = async () => {
             );
         `);
 
-        // 3. 订单表
+        // 3. 订单表 (包含钱包地址 wallet)
         await client.query(`
             CREATE TABLE IF NOT EXISTS orders (
                 order_id TEXT PRIMARY KEY,
@@ -79,7 +81,7 @@ const initDB = async () => {
                 tracking_number TEXT,
                 qrcode_url TEXT,
                 proof TEXT,
-                wallet TEXT,
+                wallet TEXT, 
                 expires_at TIMESTAMP,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
@@ -117,12 +119,19 @@ const initDB = async () => {
         `);
 
         // 初始化默认设置
-        await client.query(`INSERT INTO settings (key, value) VALUES ('rate', '7.0') ON CONFLICT DO NOTHING;`);
-        await client.query(`INSERT INTO settings (key, value) VALUES ('feeRate', '0') ON CONFLICT DO NOTHING;`);
-        await client.query(`INSERT INTO settings (key, value) VALUES ('announcement', '欢迎来到小暗网') ON CONFLICT DO NOTHING;`);
-        await client.query(`INSERT INTO settings (key, value) VALUES ('popup', 'true') ON CONFLICT DO NOTHING;`);
+        const defaults = [
+            ['rate', '7.0'],
+            ['feeRate', '0'],
+            ['announcement', '欢迎来到 NEXUS 商城'],
+            ['popup', 'true'],
+            ['walletAddress', '请联系客服获取地址'] // 默认钱包
+        ];
 
-        console.log("✅ 数据库表结构初始化完成 (Neon)");
+        for (const [k, v] of defaults) {
+            await client.query(`INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT DO NOTHING`, [k, v]);
+        }
+
+        console.log("✅ 数据库表结构初始化完成");
         client.release();
     } catch (err) {
         console.error("❌ 数据库初始化失败:", err);
@@ -131,7 +140,7 @@ const initDB = async () => {
 
 initDB();
 
-// 辅助函数：获取设置
+// 数据库辅助函数
 const getSetting = async (key) => {
     const res = await pool.query('SELECT value FROM settings WHERE key = $1', [key]);
     return res.rows.length > 0 ? res.rows[0].value : null;
@@ -155,82 +164,103 @@ bot.on('message', async (msg) => {
     const type = msg.chat.type;
     const text = msg.text ? msg.text.trim() : '';
 
-    if (type === 'private') return; // 私聊静默
+    // 1. 私聊静默
+    if (type === 'private') return;
 
+    // 2. 非管理员群自动退群
     if (chatId.toString() !== TG_ADMIN_GROUP_ID.toString()) {
+        console.log(`⚠️ 未授权群组 ${chatId}，正在退出...`);
         bot.leaveChat(chatId).catch(()=>{});
         return; 
     }
 
-    // /bz 指令
+    // --- 管理员指令 ---
+
+    // /bz 帮助
     if (text === '/bz' || text === '/help') {
         const helpMsg = `
-<b>🤖 小暗网 控台指令手册 (Neon版)</b>
-
-1. <b>/ck</b> - 查看数据库统计
-2. <b>/qc</b> - ⚠️ 清空所有数据 (慎用)
-3. <b>设置汇率 [数字]</b> - 修改USDT汇率
-4. <b>设置手续费 [数字]</b> - 修改手续费%
+<b>🤖 NEXUS 控台指令</b>
+━━━━━━━━━━━━━━
+1. <b>/ck</b> - 查看数据统计
+2. <b>/qc</b> - ⚠️ 清空所有数据
+3. <b>设置汇率 [数值]</b>
+4. <b>设置手续费 [数值]</b>
+5. <b>设置钱包 [地址]</b> - 修改USDT收款地址
+6. <b>/fix_db</b> - 修复数据库字段缺失
         `;
         bot.sendMessage(chatId, helpMsg, { parse_mode: 'HTML' });
     }
 
-    // /ck 指令
+    // /ck 查看数据
     else if (text === '/ck') {
         try {
-            const userCount = (await pool.query('SELECT COUNT(*) FROM users')).rows[0].count;
-            const orderCount = (await pool.query('SELECT COUNT(*) FROM orders')).rows[0].count;
-            const prodCount = (await pool.query('SELECT COUNT(*) FROM products')).rows[0].count;
-            const rate = await getSetting('rate');
-            const fee = await getSetting('feeRate');
+            const u = (await pool.query('SELECT COUNT(*) FROM users')).rows[0].count;
+            const o = (await pool.query('SELECT COUNT(*) FROM orders')).rows[0].count;
+            const p = (await pool.query('SELECT COUNT(*) FROM products')).rows[0].count;
+            const r = await getSetting('rate');
+            const f = await getSetting('feeRate');
+            const w = await getSetting('walletAddress');
 
             const stats = `
-<b>📊 小暗网 数据库统计</b>
+<b>📊 实时数据统计</b>
 ━━━━━━━━━━━━━━
-👤 用户总数: ${userCount}
-📦 订单总数: ${orderCount}
-🛒 商品总数: ${prodCount}
-💰 当前汇率: ${rate}
-💸 手续费率: ${fee}%
+👤 用户: ${u} | 📦 订单: ${o} | 🛒 商品: ${p}
+💰 汇率: ${r} | 💸 手续费: ${f}%
+👛 钱包: <code>${w}</code>
             `;
             bot.sendMessage(chatId, stats, { parse_mode: 'HTML' });
-        } catch (e) {
-            bot.sendMessage(chatId, "❌ 读取数据库失败: " + e.message);
-        }
+        } catch (e) { bot.sendMessage(chatId, "❌ 读取失败: " + e.message); }
     }
 
-    // /qc 指令
+    // /qc 清空数据
     else if (text === '/qc') {
         try {
             await pool.query('TRUNCATE users, orders, chats');
             bot.sendMessage(chatId, "🗑️ <b>用户、订单、聊天记录已清空！</b>", { parse_mode: 'HTML' });
-        } catch(e) {
-            bot.sendMessage(chatId, "❌ 清空失败");
-        }
+        } catch(e) { bot.sendMessage(chatId, "❌ 操作失败"); }
     }
 
     // 设置汇率
     else if (text.startsWith('设置汇率 ')) {
-        const rate = parseFloat(text.split(' ')[1]);
-        if (!isNaN(rate)) {
-            await setSetting('rate', rate);
-            bot.sendMessage(chatId, `✅ <b>汇率已更新</b>: ${rate}`, { parse_mode: 'HTML' });
+        const val = parseFloat(text.split(' ')[1]);
+        if (!isNaN(val)) {
+            await setSetting('rate', val);
+            bot.sendMessage(chatId, `✅ 汇率已设为: ${val}`);
         }
     }
 
     // 设置手续费
     else if (text.startsWith('设置手续费 ')) {
-        const fee = parseFloat(text.split(' ')[1]);
-        if (!isNaN(fee)) {
-            await setSetting('feeRate', fee);
-            bot.sendMessage(chatId, `✅ <b>手续费已更新</b>: ${fee}%`, { parse_mode: 'HTML' });
+        const val = parseFloat(text.split(' ')[1]);
+        if (!isNaN(val)) {
+            await setSetting('feeRate', val);
+            bot.sendMessage(chatId, `✅ 手续费已设为: ${val}%`);
         }
+    }
+
+    // 设置钱包
+    else if (text.startsWith('设置钱包 ')) {
+        const addr = text.split(' ')[1];
+        if (addr && addr.length > 10) {
+            await setSetting('walletAddress', addr);
+            bot.sendMessage(chatId, `✅ <b>收款地址已更新</b>\n<code>${addr}</code>`, {parse_mode:'HTML'});
+        } else {
+            bot.sendMessage(chatId, "❌ 地址格式好像不对");
+        }
+    }
+
+    // 数据库修复 (防止 wallet 字段报错)
+    else if (text === '/fix_db') {
+        try {
+            await pool.query('ALTER TABLE orders ADD COLUMN IF NOT EXISTS wallet TEXT;');
+            bot.sendMessage(chatId, "✅ 数据库字段修复完成");
+        } catch(e) { bot.sendMessage(chatId, "❌ " + e.message); }
     }
 });
 
 
 // ==========================================
-// 🌐 Express 配置
+// 🌐 服务器配置
 // ==========================================
 app.use(cors());
 app.use(bodyParser.json());
@@ -239,11 +269,13 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 if (!fs.existsSync('uploads')) fs.mkdirSync('uploads');
 
-const storage = multer.diskStorage({
-    destination: (req, file, cb) => cb(null, 'uploads/'),
-    filename: (req, file, cb) => cb(null, Date.now() + path.extname(file.originalname))
+const upload = multer({ 
+    storage: multer.diskStorage({
+        destination: (req, file, cb) => cb(null, 'uploads/'),
+        filename: (req, file, cb) => cb(null, Date.now() + path.extname(file.originalname))
+    })
 });
-const upload = multer({ storage });
+
 const adminAuth = (req, res, next) => {
     if(req.headers['authorization'] === ADMIN_TOKEN) next();
     else res.status(401).json({msg:'Unauthorized'});
@@ -251,7 +283,7 @@ const adminAuth = (req, res, next) => {
 
 
 // ==========================================
-// 🛒 API 路由 (已适配 Postgres)
+// 🛒 前端 API
 // ==========================================
 
 // 1. 公共数据
@@ -259,10 +291,12 @@ app.get('/api/public/data', async (req, res) => {
     try {
         const prods = await pool.query('SELECT * FROM products WHERE stock > 0 OR is_pinned = TRUE ORDER BY is_pinned DESC, id DESC');
         const hiring = await pool.query('SELECT * FROM hiring');
+        
         const rate = await getSetting('rate');
         const feeRate = await getSetting('feeRate');
-        const ann = await getSetting('announcement');
-        const pop = await getSetting('popup');
+        const announcement = await getSetting('announcement');
+        const popup = await getSetting('popup');
+        const wallet = await getSetting('walletAddress');
 
         const categories = [...new Set(prods.rows.map(p => p.category))];
 
@@ -272,10 +306,11 @@ app.get('/api/public/data', async (req, res) => {
             hiring: hiring.rows,
             rate: parseFloat(rate),
             feeRate: parseFloat(feeRate),
-            announcement: ann,
-            showPopup: pop === 'true'
+            announcement,
+            showPopup: popup === 'true',
+            wallet // 将钱包地址传给前端
         });
-    } catch(e) { console.error(e); res.status(500).json({error: e.message}); }
+    } catch(e) { res.status(500).json({error: e.message}); }
 });
 
 // 2. 注册
@@ -287,7 +322,6 @@ app.post('/api/user/register', async (req, res) => {
 
         const id = uid || Math.floor(100000 + Math.random() * 900000);
         await pool.query('INSERT INTO users (id, contact, password, balance) VALUES ($1, $2, $3, 0)', [id, contact, password]);
-        
         res.json({ success: true, isNew: true, userId: id, uid: id, balance: 0 });
     } catch(e) { res.json({success:false, msg: e.message}); }
 });
@@ -296,9 +330,9 @@ app.post('/api/user/register', async (req, res) => {
 app.post('/api/user/login', async (req, res) => {
     const { contact, password } = req.body;
     try {
-        const result = await pool.query('SELECT * FROM users WHERE contact = $1 AND password = $2', [contact, password]);
-        if(result.rows.length > 0) {
-            const u = result.rows[0];
+        const resDb = await pool.query('SELECT * FROM users WHERE contact = $1 AND password = $2', [contact, password]);
+        if(resDb.rows.length > 0) {
+            const u = resDb.rows[0];
             res.json({ success: true, userId: u.id, uid: u.id, balance: parseFloat(u.balance) });
         } else {
             res.json({ success: false, msg: '账号或密码错误' });
@@ -309,23 +343,31 @@ app.post('/api/user/login', async (req, res) => {
 // 4. 获取余额
 app.get('/api/user/balance', async (req, res) => {
     try {
-        const result = await pool.query('SELECT balance FROM users WHERE id = $1', [req.query.userId]);
-        if(result.rows.length > 0) res.json({ success: true, balance: parseFloat(result.rows[0].balance) });
+        const resDb = await pool.query('SELECT balance FROM users WHERE id = $1', [req.query.userId]);
+        if(resDb.rows.length > 0) res.json({ success: true, balance: parseFloat(resDb.rows[0].balance) });
         else res.json({ success: false });
     } catch(e) { res.json({success:false}); }
 });
 
-// 5. 修改密码
+// 5. 修改密码 (前端要求直接修改)
 app.post('/api/user/change-password', async (req, res) => {
     const { userId, oldPassword, newPassword } = req.body;
     try {
-        const user = await pool.query('SELECT password FROM users WHERE id = $1', [userId]);
-        if(user.rows.length === 0) return res.json({success:false, msg:'用户不存在'});
-        if(user.rows[0].password !== oldPassword) return res.json({success:false, msg:'旧密码错误'});
+        // 先验证旧密码
+        const userRes = await pool.query('SELECT password FROM users WHERE id = $1', [userId]);
+        if (userRes.rows.length === 0) return res.json({success: false, msg: '用户不存在'});
+        
+        if (userRes.rows[0].password !== oldPassword) {
+            return res.json({success: false, msg: '旧密码错误'});
+        }
 
+        // 更新密码
         await pool.query('UPDATE users SET password = $1 WHERE id = $2', [newPassword, userId]);
-        res.json({success:true, msg:'修改成功'});
-    } catch(e) { res.json({success:false, msg: e.message}); }
+        res.json({success: true, msg: '修改成功'});
+    } catch (e) {
+        console.error(e);
+        res.json({success: false, msg: '服务器错误'});
+    }
 });
 
 // 6. 提交订单
@@ -345,7 +387,6 @@ app.post('/api/order', async (req, res) => {
             if(prod) {
                 prodName = prod.name;
                 amount = parseFloat(prod.price);
-                // 扣库存
                 await pool.query('UPDATE products SET stock = stock - 1 WHERE id = $1', [productId]);
             }
         } else {
@@ -354,10 +395,8 @@ app.post('/api/order', async (req, res) => {
 
         let finalUSDT = amount;
         if(useBalance && user && parseFloat(user.balance) > 0) {
-            const balance = parseFloat(user.balance);
-            const deduct = Math.min(balance, amount);
+            const deduct = Math.min(parseFloat(user.balance), amount);
             finalUSDT -= deduct;
-            // 扣余额
             await pool.query('UPDATE users SET balance = balance - $1 WHERE id = $2', [deduct, userId]);
         }
 
@@ -366,7 +405,8 @@ app.post('/api/order', async (req, res) => {
         const cnyAmount = (finalUSDT * rate * (1 + feeRate/100)).toFixed(2);
         
         const orderId = 'ORD-' + Date.now();
-        const wallet = 'Txxxxxxxxxxxxxxxxxxxxxx'; // 收款地址
+        // 获取当前数据库中的钱包地址
+        const wallet = await getSetting('walletAddress');
 
         await pool.query(
             `INSERT INTO orders (order_id, user_id, product_name, payment_method, usdt_amount, cny_amount, shipping_info, wallet, expires_at) 
@@ -376,7 +416,7 @@ app.post('/api/order', async (req, res) => {
 
         // TG 推送
         let tgMsg = `🆕 <b>新订单提醒</b>\n\n单号: <code>${orderId}</code>\n用户: ${user ? user.contact : userId}\n商品: ${prodName}\n支付: ${paymentMethod}\n金额: ${finalUSDT.toFixed(4)} USDT`;
-        if(paymentMethod !== 'USDT') tgMsg += `\n⚠️ <b>待收款</b>`;
+        if(paymentMethod !== 'USDT') tgMsg += `\n⚠️ <b>需要人工处理</b>`;
         sendTgNotify(tgMsg);
 
         res.json({ success: true, orderId, usdtAmount: finalUSDT.toFixed(4), cnyAmount, wallet });
@@ -384,7 +424,7 @@ app.post('/api/order', async (req, res) => {
     } catch(e) { console.error(e); res.json({success:false, msg: e.message}); }
 });
 
-// 7. 获取订单列表
+// 7. 获取订单
 app.get('/api/order', async (req, res) => {
     try {
         const result = await pool.query('SELECT * FROM orders WHERE user_id = $1 ORDER BY created_at DESC', [req.query.userId]);
@@ -397,23 +437,41 @@ app.post('/api/order/confirm-payment', async (req, res) => {
     const { orderId, proof } = req.body;
     try {
         await pool.query("UPDATE orders SET proof = $1, status = '待审核' WHERE order_id = $2", [proof, orderId]);
-        sendTgNotify(`📸 <b>支付凭证上传</b>\n单号: <code>${orderId}</code>\n请进后台审核。`);
+        sendTgNotify(`📸 <b>用户上传凭证</b>\n单号: <code>${orderId}</code>\n请进后台审核。`);
         res.json({success:true});
     } catch(e) { res.json({success:false}); }
 });
 
 // 9. 二维码异常
 app.post('/api/order/report-qr-issue', async (req, res) => {
-    sendTgNotify(`🚨 <b>二维码异常</b>\n单号: <code>${req.body.orderId}</code>`);
+    sendTgNotify(`🚨 <b>二维码异常反馈</b>\n单号: <code>${req.body.orderId}</code>`);
     res.json({success:true});
 });
 
-// 10. 聊天
+// 10. 提现申请
+app.post('/api/withdraw', async (req, res) => {
+    const { userId, amount, address } = req.body;
+    try {
+        const val = parseFloat(amount);
+        // 检查余额
+        const userRes = await pool.query('SELECT balance FROM users WHERE id = $1', [userId]);
+        if(userRes.rows[0].balance < val) return res.json({success:false, msg:'余额不足'});
+
+        // 扣余额
+        await pool.query('UPDATE users SET balance = balance - $1 WHERE id = $2', [val, userId]);
+        
+        // 发送通知
+        sendTgNotify(`💸 <b>新提现申请</b>\n用户ID: ${userId}\n金额: ${val} USDT\n地址: <code>${address}</code>`);
+        res.json({success:true});
+    } catch(e) { res.json({success:false, msg:'Error'}); }
+});
+
+// 11. 聊天
 app.post('/api/chat/send', async (req, res) => {
     const { sessionId, text } = req.body;
     try {
         await pool.query('INSERT INTO chats (session_id, sender, content) VALUES ($1, $2, $3)', [sessionId, 'user', text]);
-        sendTgNotify(`💬 <b>在线客服</b>\nID: ${sessionId}\n消息: ${text}`);
+        sendTgNotify(`💬 <b>客服消息</b>\n来自: ${sessionId}\n内容: ${text}`);
         res.json({ success: true });
     } catch(e) { res.json({success:false}); }
 });
@@ -426,9 +484,8 @@ app.get('/api/chat/history/:sid', async (req, res) => {
 });
 
 // ==========================================
-// 🔧 后台管理接口 (Admin)
+// 🔧 后台管理 (Admin)
 // ==========================================
-
 app.post('/api/admin/login', (req, res) => {
     if(req.body.username === 'admin' && req.body.password === ADMIN_TOKEN) 
         res.json({success:true, token: ADMIN_TOKEN});
@@ -441,9 +498,8 @@ app.get('/api/admin/all', adminAuth, async (req, res) => {
         const orders = await pool.query('SELECT * FROM orders ORDER BY created_at DESC');
         const products = await pool.query('SELECT * FROM products ORDER BY id DESC');
         const hiring = await pool.query('SELECT * FROM hiring');
-        
-        // 整理聊天记录
         const chatsRes = await pool.query('SELECT * FROM chats ORDER BY created_at ASC');
+        
         let chats = {};
         chatsRes.rows.forEach(msg => {
             if(!chats[msg.session_id]) chats[msg.session_id] = [];
@@ -466,10 +522,9 @@ app.get('/api/admin/all', adminAuth, async (req, res) => {
             announcement,
             popup: popup === 'true'
         });
-    } catch(e) { console.error(e); res.status(500).json({}); }
+    } catch(e) { res.status(500).json({}); }
 });
 
-// 后台修改余额
 app.post('/api/admin/user/balance', adminAuth, async (req, res) => {
     const { userId, amount, type } = req.body;
     try {
@@ -478,37 +533,64 @@ app.post('/api/admin/user/balance', adminAuth, async (req, res) => {
         if(type === 'add') sql = 'UPDATE users SET balance = balance + $1 WHERE id = $2';
         if(type === 'subtract') sql = 'UPDATE users SET balance = GREATEST(0, balance - $1) WHERE id = $2';
         if(type === 'set') sql = 'UPDATE users SET balance = $1 WHERE id = $2';
-        
         await pool.query(sql, [val, userId]);
         res.json({success:true});
     } catch(e) { res.json({success:false}); }
 });
 
-// 后台发起聊天
 app.post('/api/admin/chat/initiate', adminAuth, async (req, res) => {
     const sid = `user_${req.body.userId}`;
     await pool.query("INSERT INTO chats (session_id, sender, content, is_initiate) VALUES ($1, 'admin', '客服已接入', TRUE)", [sid]);
     res.json({success:true, sessionId: sid});
 });
 
-// 后台回复
 app.post('/api/admin/reply', adminAuth, async (req, res) => {
     const { sessionId, text } = req.body;
     await pool.query("INSERT INTO chats (session_id, sender, content) VALUES ($1, 'admin', $2)", [sessionId, text]);
     res.json({success:true});
 });
 
-// 后台商品管理 (增删改)
-app.post('/api/admin/product', adminAuth, async (req, res) => {
-    const { name, price, stock, category, type, desc, imageUrl } = req.body;
-    const id = Date.now();
-    await pool.query(
-        'INSERT INTO products (id, name, price, stock, category, type, description, image_url) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)',
-        [id, name, price, stock, category, type, desc, imageUrl]
-    );
+app.post('/api/upload', adminAuth, upload.single('file'), (req, res) => {
+    if(req.file) res.json({success:true, url: `/uploads/${req.file.filename}`});
+    else res.json({success:false, error:'No file'});
+});
+
+app.post('/api/admin/order/ship', adminAuth, (req, res) => {
+    const { orderId, trackingNumber } = req.body;
+    // 这里简单处理，实际应更新数据库状态
+    pool.query("UPDATE orders SET tracking_number = $1, status = '已发货' WHERE order_id = $2", [trackingNumber, orderId]);
+    sendTgNotify(`🚚 <b>订单已发货</b>\n单号: <code>${orderId}</code>\n物流: ${trackingNumber}`);
     res.json({success:true});
 });
 
+app.post('/api/admin/order/upload_qrcode', adminAuth, upload.single('qrcode'), (req, res) => {
+    const { orderId } = req.body;
+    if(req.file) {
+        const url = `/uploads/${req.file.filename}`;
+        pool.query("UPDATE orders SET qrcode_url = $1 WHERE order_id = $2", [url, orderId]);
+        sendTgNotify(`✅ <b>收款码已上传</b>\n单号: <code>${orderId}</code>`);
+        res.json({success:true});
+    } else res.json({success:false});
+});
+
+app.post('/api/admin/update/announcement', adminAuth, async (req, res) => {
+    await setSetting('announcement', req.body.text);
+    res.json({success:true});
+});
+app.post('/api/admin/update/popup', adminAuth, async (req, res) => {
+    await setSetting('popup', req.body.open);
+    res.json({success:true});
+});
+
+// 商品增删改
+app.post('/api/admin/product', adminAuth, async (req, res) => {
+    const { name, price, stock, category, type, desc, imageUrl } = req.body;
+    await pool.query(
+        'INSERT INTO products (id, name, price, stock, category, type, description, image_url) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)',
+        [Date.now(), name, price, stock, category, type, desc, imageUrl]
+    );
+    res.json({success:true});
+});
 app.put('/api/admin/product/:id', adminAuth, async (req, res) => {
     const { name, price, stock, category, type, desc, imageUrl } = req.body;
     await pool.query(
@@ -517,13 +599,26 @@ app.put('/api/admin/product/:id', adminAuth, async (req, res) => {
     );
     res.json({success:true});
 });
-
 app.delete('/api/admin/product/:id', adminAuth, async (req, res) => {
     await pool.query('DELETE FROM products WHERE id = $1', [req.params.id]);
     res.json({success:true});
 });
+// 招聘更新
+app.post('/api/admin/update/hiring', adminAuth, async (req, res) => {
+    const list = req.body; // array
+    // 简单暴力：清空重写
+    await pool.query('TRUNCATE hiring');
+    for (const job of list) {
+        await pool.query('INSERT INTO hiring (title, content, contact) VALUES ($1, $2, $3)', [job.title, job.content, job.contact]);
+    }
+    res.json({success:true});
+});
+app.post('/api/admin/confirm_pay', adminAuth, async (req, res) => {
+    await pool.query("UPDATE orders SET status = '已支付' WHERE order_id = $1", [req.body.orderId]);
+    res.json({success:true});
+});
 
-// 启动
+
 app.listen(PORT, () => {
-    console.log(`🚀 Server running on port ${PORT} (Neon DB)`);
+    console.log(`🚀 Server running on port ${PORT}`);
 });
