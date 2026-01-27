@@ -1,3 +1,7 @@
+/**
+ * NEXUS Backend - 最终完整版 (Neon PostgreSQL + TG Bot)
+ */
+
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
@@ -259,14 +263,7 @@ bot.on('message', async (msg) => {
 // 🌐 服务器配置
 // ==========================================
 
-app.use(cors({
-    origin: '*',
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
-    credentials: true
-}));
-app.options('*', cors());
-
+app.use(cors());
 app.use(bodyParser.json({ limit: '50mb' }));
 app.use(bodyParser.urlencoded({ limit: '50mb', extended: true }));
 app.use(express.static('public'));
