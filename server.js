@@ -698,8 +698,24 @@ app.post('/api/admin/update/hiring', adminAuth, async (req, res) => {
     res.json({success:true});
 });
 app.post('/api/admin/confirm_pay', adminAuth, async (req, res) => {
-    await pool.query("UPDATE orders SET status = '已支付' WHERE order_id = $1", [req.body.orderId]);
-    res.json({success:true});
+    const { orderId } = req.body;
+    try {
+        const orderRes = await pool.query("SELECT * FROM orders WHERE order_id = $1", [orderId]);
+        const order = orderRes.rows[0];
+        
+        if (order && order.status !== '已支付') {
+            await pool.query("UPDATE orders SET status = '已支付' WHERE order_id = $1", [orderId]);
+            
+            if (order.product_name === '余额充值') {
+                await pool.query("UPDATE users SET balance = balance + $1 WHERE id = $2", [parseFloat(order.usdt_amount), order.user_id]);
+            }
+            res.json({success:true});
+        } else {
+            res.json({success:false, msg:'订单不存在或已支付'});
+        }
+    } catch(e) {
+        res.status(500).json({success:false, msg:e.message});
+    }
 });
 
 
