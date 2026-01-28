@@ -494,13 +494,25 @@ app.get('/api/user/records', async (req, res) => {
 });
 
 // 8. 确认支付凭证
-app.post('/api/order/confirm-payment', async (req, res) => {
-    const { orderId, proof } = req.body;
+app.post('/api/order/confirm-payment', upload.single('file'), async (req, res) => {
     try {
+        const orderId = req.body.orderId;
+        let proof = '';
+        
+        if (req.file) {
+            const b64 = Buffer.from(req.file.buffer).toString('base64');
+            proof = `data:${req.file.mimetype};base64,${b64}`;
+        } else {
+            return res.json({success:false, msg:'请选择图片'});
+        }
+
         await pool.query("UPDATE orders SET proof = $1, status = '待审核' WHERE order_id = $2", [proof, orderId]);
         sendTgNotify(`📸 <b>用户上传凭证</b>\n单号: <code>${orderId}</code>\n请进后台审核。`);
         res.json({success:true});
-    } catch(e) { res.json({success:false}); }
+    } catch(e) { 
+        console.error(e);
+        res.json({success:false, msg: e.message}); 
+    }
 });
 
 // 9. 二维码异常
