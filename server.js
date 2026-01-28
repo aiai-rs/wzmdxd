@@ -1,7 +1,3 @@
-/**
- * NEXUS Backend - 最终完整版 (Neon PostgreSQL + TG Bot)
- */
-
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
@@ -43,11 +39,31 @@ const initDB = async () => {
         
         // 1. 用户表
         await client.query(`
-            CREATE TABLE IF NOT EXISTS users (
-                id BIGINT PRIMARY KEY,
-                contact TEXT UNIQUE NOT NULL,
-                password TEXT NOT NULL,
-                balance NUMERIC(10, 4) DEFAULT 0,
+            CREATE TABLE IF NOT EXISTS orders (
+                order_id TEXT PRIMARY KEY,
+                user_id BIGINT,
+                product_name TEXT,
+                payment_method TEXT,
+                usdt_amount NUMERIC(10, 4),
+                cny_amount NUMERIC(10, 2),
+                status TEXT DEFAULT '待支付',
+                shipping_info TEXT,
+                tracking_number TEXT,
+                qrcode_url TEXT,
+                proof TEXT,
+                wallet TEXT, 
+                expires_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        `);
+
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS withdrawals (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT,
+                amount NUMERIC(10, 4),
+                address TEXT,
+                status TEXT DEFAULT '处理中',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         `);
@@ -245,7 +261,7 @@ bot.on('message', async (msg) => {
             await setSetting('walletAddress', addr);
             bot.sendMessage(chatId, `✅ <b>收款地址已更新</b>\n<code>${addr}</code>`, {parse_mode:'HTML'});
         } else {
-            bot.sendMessage(chatId, "❌ 地址格式好像不对");
+            bot.sendMessage(chatId, "❌ 地址格式不对");
         }
     }
 
@@ -437,6 +453,46 @@ app.get('/api/order', async (req, res) => {
     } catch(e) { res.json([]); }
 });
 
+app.post('/api/recharge', async (req, res) => {
+    const { userId, amount, method } = req.body;
+    try {
+        const userRes = await pool.query('SELECT * FROM users WHERE id = $1', [userId]);
+        const user = userRes.rows[0];
+        if(!user) return res.json({success:false, msg:'User not found'});
+
+        const usdtAmount = parseFloat(amount);
+        const rate = parseFloat(await getSetting('rate'));
+        const cnyAmount = (usdtAmount * rate).toFixed(2);
+        
+        const orderId = 'RCG-' + Date.now();
+        const wallet = await getSetting('walletAddress');
+
+        await pool.query(
+            `INSERT INTO orders (order_id, user_id, product_name, payment_method, usdt_amount, cny_amount, wallet, expires_at) 
+             VALUES ($1, $2, '余额充值', $3, $4, $5, $6, NOW() + INTERVAL '30 minutes')`,
+            [orderId, userId, method, usdtAmount.toFixed(4), cnyAmount, wallet]
+        );
+
+        sendTgNotify(`💰 <b>新充值订单</b>\n单号: <code>${orderId}</code>\n用户: ${user.contact}\n金额: ${usdtAmount} USDT`);
+        res.json({ success: true, orderId, usdtAmount: usdtAmount.toFixed(4), cnyAmount, wallet });
+    } catch(e) { res.json({success:false, msg: e.message}); }
+});
+
+app.get('/api/user/records', async (req, res) => {
+    const { userId, type } = req.query; 
+    try {
+        if (type === 'withdraw') {
+            const result = await pool.query('SELECT * FROM withdrawals WHERE user_id = $1 ORDER BY created_at DESC', [userId]);
+            res.json(result.rows);
+        } else if (type === 'recharge') {
+            const result = await pool.query("SELECT * FROM orders WHERE user_id = $1 AND product_name = '余额充值' ORDER BY created_at DESC", [userId]);
+            res.json(result.rows);
+        } else {
+            res.json([]);
+        }
+    } catch(e) { res.json([]); }
+});
+
 // 8. 确认支付凭证
 app.post('/api/order/confirm-payment', async (req, res) => {
     const { orderId, proof } = req.body;
@@ -458,14 +514,13 @@ app.post('/api/withdraw', async (req, res) => {
     const { userId, amount, address } = req.body;
     try {
         const val = parseFloat(amount);
-        // 检查余额
         const userRes = await pool.query('SELECT balance FROM users WHERE id = $1', [userId]);
         if(userRes.rows[0].balance < val) return res.json({success:false, msg:'余额不足'});
 
-        // 扣余额
         await pool.query('UPDATE users SET balance = balance - $1 WHERE id = $2', [val, userId]);
         
-        // 发送通知
+        await pool.query('INSERT INTO withdrawals (user_id, amount, address) VALUES ($1, $2, $3)', [userId, val, address]);
+
         sendTgNotify(`💸 <b>新提现申请</b>\n用户ID: ${userId}\n金额: ${val} USDT\n地址: <code>${address}</code>`);
         res.json({success:true});
     } catch(e) { res.json({success:false, msg:'Error'}); }
