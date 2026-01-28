@@ -393,7 +393,7 @@ app.post('/api/user/change-password', async (req, res) => {
 
 // 6. 提交订单
 app.post('/api/order', async (req, res) => {
-    const { userId, productId, paymentMethod, shippingInfo, useBalance, balanceAmount } = req.body;
+    const { userId, productId, paymentMethod, shippingInfo, useBalance, balanceAmount, contactInfo } = req.body;
     
     try {
         const userRes = await pool.query('SELECT * FROM users WHERE id = $1', [userId]);
@@ -426,17 +426,17 @@ app.post('/api/order', async (req, res) => {
         const cnyAmount = (finalUSDT * rate * (1 + feeRate/100)).toFixed(2);
         
         const orderId = 'ORD-' + Date.now();
-        // 获取当前数据库中的钱包地址
         const wallet = await getSetting('walletAddress');
+        // 获取当前数据库中的钱包地址
+        const finalShippingInfo = { ...shippingInfo, contact_method: contactInfo };
 
         await pool.query(
             `INSERT INTO orders (order_id, user_id, product_name, payment_method, usdt_amount, cny_amount, shipping_info, wallet, expires_at) 
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW() + INTERVAL '30 minutes')`,
-            [orderId, userId, prodName, paymentMethod, finalUSDT.toFixed(4), cnyAmount, JSON.stringify(shippingInfo), wallet]
+            [orderId, userId, prodName, paymentMethod, finalUSDT.toFixed(4), cnyAmount, JSON.stringify(finalShippingInfo), wallet]
         );
 
-        // TG 推送
-        let tgMsg = `🆕 <b>新订单提醒</b>\n\n单号: <code>${orderId}</code>\n用户: ${user ? user.contact : userId}\n商品: ${prodName}\n支付: ${paymentMethod}\n金额: ${finalUSDT.toFixed(4)} USDT`;
+        let tgMsg = `🆕 <b>新订单提醒</b>\n\n单号: <code>${orderId}</code>\n用户: ${user ? user.contact : userId}\n联系: ${contactInfo}\n商品: ${prodName}\n支付: ${paymentMethod}\n金额: ${finalUSDT.toFixed(4)} USDT`;
         if(paymentMethod !== 'USDT') tgMsg += `\n⚠️ <b>需要人工处理</b>`;
         sendTgNotify(tgMsg);
 
@@ -448,7 +448,13 @@ app.post('/api/order', async (req, res) => {
 // 7. 获取订单
 app.get('/api/order', async (req, res) => {
     try {
-        const result = await pool.query('SELECT * FROM orders WHERE user_id = $1 ORDER BY created_at DESC', [req.query.userId]);
+        const result = await pool.query(`
+            SELECT orders.*, products.image_url 
+            FROM orders 
+            LEFT JOIN products ON orders.product_name = products.name 
+            WHERE orders.user_id = $1 
+            ORDER BY orders.created_at DESC
+        `, [req.query.userId]);
         res.json(result.rows);
     } catch(e) { res.json([]); }
 });
