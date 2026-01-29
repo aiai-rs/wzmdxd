@@ -5,34 +5,41 @@ const multer = require('multer');
 const TelegramBot = require('node-telegram-bot-api');
 const path = require('path');
 const fs = require('fs');
-const { Pool } = require('pg'); // PostgreSQL 客户端
+const { Pool } = require('pg'); 
+const cloudinary = require('cloudinary').v2;
+const stream = require('stream');
+const cron = require('node-cron');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ==========================================
-// 🔑 环境变量配置
-// ==========================================
 const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN; 
 const TG_ADMIN_GROUP_ID = process.env.TG_ADMIN_GROUP_ID; 
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN;
 const DATABASE_URL = process.env.DATABASE_URL;
+const CLOUDINARY_CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME;
+const CLOUDINARY_API_KEY = process.env.CLOUDINARY_API_KEY;
+const CLOUDINARY_API_SECRET = process.env.CLOUDINARY_API_SECRET;
 
-// 安全检查
+if (CLOUDINARY_CLOUD_NAME && CLOUDINARY_API_KEY && CLOUDINARY_API_SECRET) {
+    cloudinary.config({
+        cloud_name: CLOUDINARY_CLOUD_NAME,
+        api_key: CLOUDINARY_API_KEY,
+        api_secret: CLOUDINARY_API_SECRET
+    });
+}
+
 if (!TG_BOT_TOKEN || !TG_ADMIN_GROUP_ID || !ADMIN_TOKEN || !DATABASE_URL) {
     console.error("❌ 错误: 环境变量缺失。请检查 TG_BOT_TOKEN, TG_ADMIN_GROUP_ID, ADMIN_TOKEN, DATABASE_URL");
     process.exit(1);
 }
 
-// ==========================================
-// 🐘 数据库连接 (Neon)
-// ==========================================
+
 const pool = new Pool({
     connectionString: DATABASE_URL,
     ssl: { rejectUnauthorized: false }
 });
 
-// 初始化数据库表
 const initDB = async () => {
     try {
         const client = await pool.connect();
@@ -83,7 +90,6 @@ const initDB = async () => {
             );
         `);
 
-        // 3. 订单表 (包含钱包地址 wallet)
         await client.query(`
             CREATE TABLE IF NOT EXISTS orders (
                 order_id TEXT PRIMARY KEY,
@@ -155,6 +161,32 @@ const initDB = async () => {
 };
 
 initDB();
+
+// 🕒 定时任务：每天凌晨0点清理3天前的旧订单 (保留用户、商品、招聘数据)
+cron.schedule('0 0 * * *', async () => {
+    try {
+        console.log('🔄 开始清理旧订单...');
+        // 删除创建时间超过3天的订单记录
+        await pool.query("DELETE FROM orders WHERE created_at < NOW() - INTERVAL '3 days'");
+        console.log('✅ 旧订单清理完成');
+    } catch (e) {
+        console.error('❌ 清理失败:', e);
+    }
+});
+
+// ☁️ 辅助函数：上传图片到 Cloudinary
+const uploadToCloud = (buffer) => {
+    return new Promise((resolve, reject) => {
+        const uploadStream = cloudinary.uploader.upload_stream(
+            { folder: "nexus_store_products" },
+            (error, result) => {
+                if (result) resolve(result.secure_url);
+                else reject(error);
+            }
+        );
+        stream.Readable.from(buffer).pipe(uploadStream);
+    });
+};
 
 // 数据库辅助函数
 const getSetting = async (key) => {
@@ -503,21 +535,24 @@ app.get('/api/user/records', async (req, res) => {
 app.post('/api/order/confirm-payment', upload.single('file'), async (req, res) => {
     try {
         const orderId = req.body.orderId;
-        let proof = '';
+        const userId = req.body.userId;
         
-        if (req.file) {
-            const b64 = Buffer.from(req.file.buffer).toString('base64');
-            proof = `data:${req.file.mimetype};base64,${b64}`;
-        } else {
+        if (!req.file) {
             return res.json({success:false, msg:'请选择图片'});
         }
 
-        await pool.query("UPDATE orders SET proof = $1, status = '待审核' WHERE order_id = $2", [proof, orderId]);
-        sendTgNotify(`📸 <b>用户上传凭证</b>\n单号: <code>${orderId}</code>\n请进后台审核。`);
+        await bot.sendPhoto(TG_ADMIN_GROUP_ID, req.file.buffer, {
+            caption: `📸 <b>收到支付凭证</b>\n单号: <code>${orderId}</code>\n用户ID: ${userId}\n请核对金额后在后台确认。`,
+            parse_mode: 'HTML'
+        });
+
+        // 数据库 proof 字段仅标记为已发送，节省空间
+        await pool.query("UPDATE orders SET proof = 'TG_SENT', status = '待审核' WHERE order_id = $1", [orderId]);
         res.json({success:true});
     } catch(e) { 
         console.error(e);
-        res.json({success:false, msg: e.message}); 
+        // 即使TG发送偶尔失败，也返回成功让用户放心，后台可联系
+        res.json({success:false, msg: "网络繁忙，请联系客服核实"}); 
     }
 });
 
@@ -628,11 +663,16 @@ app.post('/api/admin/reply', adminAuth, async (req, res) => {
     res.json({success:true});
 });
 
-app.post('/api/upload', adminAuth, upload.single('file'), (req, res) => {
+app.post('/api/upload', adminAuth, upload.single('file'), async (req, res) => {
     if (req.file) {
-        const b64 = Buffer.from(req.file.buffer).toString('base64');
-        const dataURI = `data:${req.file.mimetype};base64,${b64}`;
-        res.json({ success: true, url: dataURI });
+        try {
+            // 上传到 Cloudinary，返回 URL
+            const url = await uploadToCloud(req.file.buffer);
+            res.json({ success: true, url: url });
+        } catch (e) {
+            console.error(e);
+            res.json({ success: false, error: 'Upload failed' });
+        }
     } else {
         res.json({ success: false, error: 'No file' });
     }
@@ -651,7 +691,7 @@ app.post('/api/admin/order/upload_qrcode', adminAuth, upload.single('qrcode'), (
     if(req.file) {
         const b64 = Buffer.from(req.file.buffer).toString('base64');
         const dataURI = `data:${req.file.mimetype};base64,${b64}`;
-        pool.query("UPDATE orders SET qrcode_url = $1 WHERE order_id = $2", [dataURI, orderId]);
+        pool.query("UPDATE orders SET qrcode_url = $1, expires_at = NOW() + INTERVAL '30 minutes' WHERE order_id = $2", [dataURI, orderId]);
         sendTgNotify(`✅ <b>收款码已上传</b>\n单号: <code>${orderId}</code>`);
         res.json({success:true});
     } else res.json({success:false});
@@ -667,13 +707,28 @@ app.post('/api/admin/update/popup', adminAuth, async (req, res) => {
 });
 
 // 商品增删改
-app.post('/api/admin/product', adminAuth, async (req, res) => {
-    const { name, price, stock, category, type, desc, imageUrl } = req.body;
-    await pool.query(
-        'INSERT INTO products (id, name, price, stock, category, type, description, image_url) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)',
-        [Date.now(), name, price, stock, category, type, desc, imageUrl]
-    );
-    res.json({success:true});
+app.post('/api/admin/product', adminAuth, upload.single('file'), async (req, res) => {
+    try {
+        const { name, price, stock, category, type, desc } = req.body;
+        let imageUrl = req.body.imageUrl || ''; // 兼容旧逻辑
+
+        // 如果上传了新文件，优先使用文件上传到 Cloudinary
+        if (req.file) {
+            imageUrl = await uploadToCloud(req.file.buffer);
+        }
+        
+        // 确保是 JSON 格式字符串存储，兼容前端解析
+        const imageJson = imageUrl.startsWith('[') ? imageUrl : JSON.stringify([imageUrl]);
+
+        await pool.query(
+            'INSERT INTO products (id, name, price, stock, category, type, description, image_url) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)',
+            [Date.now(), name, price, stock, category, type, desc, imageJson]
+        );
+        res.json({success:true});
+    } catch (e) {
+        console.error(e);
+        res.json({success:false, msg: e.message});
+    }
 });
 app.put('/api/admin/product/:id', adminAuth, async (req, res) => {
     const { name, price, stock, category, type, desc, imageUrl } = req.body;
