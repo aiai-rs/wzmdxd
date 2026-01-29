@@ -1,5 +1,16 @@
 const dns = require('dns');
-dns.setDefaultResultOrder('ipv4first');
+
+const originalLookup = dns.lookup;
+dns.lookup = (hostname, options, callback) => {
+  if (typeof options === 'function') {
+    callback = options;
+    options = {};
+  }
+  if (!options) options = {};
+  options.family = 4;
+  return originalLookup(hostname, options, callback);
+};
+
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
