@@ -389,12 +389,59 @@ ${cloudInfo}${cloudBar}
         }
     }
 
-    // 数据库修复 (防止 wallet 字段报错)
+// 数据库修复 (防止 wallet 字段报错)
     else if (text === '/fix_db') {
         try {
             await pool.query('ALTER TABLE orders ADD COLUMN IF NOT EXISTS wallet TEXT;');
             bot.sendMessage(chatId, "✅ 数据库字段修复完成");
         } catch(e) { bot.sendMessage(chatId, "❌ " + e.message); }
+    }
+});
+
+bot.on('callback_query', async (callbackQuery) => {
+    const action = callbackQuery.data;
+    const msg = callbackQuery.message;
+    const chatId = msg.chat.id;
+
+    try {
+        if (action.startsWith('wd_confirm_')) {
+            const parts = action.split('_');
+            const wdId = parts[2];
+            const userId = parts[3];
+
+            await pool.query("UPDATE withdrawals SET status = '已完成' WHERE id = $1", [wdId]);
+            
+            const notifySid = `user_${userId}`;
+            await pool.query("INSERT INTO chats (session_id, sender, content) VALUES ($1, 'admin', '✅ 您的提现已处理，请查收。')", [notifySid]);
+
+            const newCaption = msg.caption ? msg.caption + "\n\n✅ <b>已打款</b>" : msg.text + "\n\n✅ <b>已打款</b>";
+            if (msg.caption) {
+                await bot.editMessageCaption(newCaption, { chat_id: chatId, message_id: msg.message_id, parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } });
+            } else {
+                await bot.editMessageText(newCaption, { chat_id: chatId, message_id: msg.message_id, parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } });
+            }
+
+        } else if (action.startsWith('wd_reject_')) {
+            const parts = action.split('_');
+            const wdId = parts[2];
+            const userId = parts[3];
+            const amount = parseFloat(parts[4]);
+
+            await pool.query("UPDATE withdrawals SET status = '已驳回' WHERE id = $1", [wdId]);
+            await pool.query("UPDATE users SET balance = balance + $1 WHERE id = $2", [amount, userId]);
+
+            const notifySid = `user_${userId}`;
+            await pool.query("INSERT INTO chats (session_id, sender, content) VALUES ($1, 'admin', '❌ 您的提现已被驳回，资金已退回余额。')", [notifySid]);
+
+            const newCaption = msg.caption ? msg.caption + "\n\n❌ <b>已驳回</b>" : msg.text + "\n\n❌ <b>已驳回</b>";
+            if (msg.caption) {
+                await bot.editMessageCaption(newCaption, { chat_id: chatId, message_id: msg.message_id, parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } });
+            } else {
+                await bot.editMessageText(newCaption, { chat_id: chatId, message_id: msg.message_id, parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } });
+            }
+        }
+    } catch (e) {
+        console.error("TG Callback Error:", e);
     }
 });
 
@@ -434,8 +481,9 @@ const adminAuth = (req, res, next) => {
 // 1. 公共数据
 app.get('/api/public/data', async (req, res) => {
     try {
-        const prods = await pool.query('SELECT * FROM products WHERE stock > 0 OR is_pinned = TRUE ORDER BY is_pinned DESC, id DESC');
-        const hiring = await pool.query('SELECT * FROM hiring');
+        
+const prods = await pool.query('SELECT * FROM products ORDER BY is_pinned DESC, id DESC');
+const hiring = await pool.query('SELECT * FROM hiring');
         
         const rate = await getSetting('rate');
         const feeRate = await getSetting('feeRate');
@@ -551,20 +599,33 @@ app.post('/api/order', async (req, res) => {
         
         const orderId = 'ORD-' + Date.now();
         const wallet = await getSetting('walletAddress');
-        // 获取当前数据库中的钱包地址
         const finalShippingInfo = { ...shippingInfo, contact_method: contactInfo };
 
+        // [修改] 判断是否全额余额抵扣
+        let orderStatus = '待支付';
+        let proofStatus = null;
+        
+        if (finalUSDT <= 0) {
+            orderStatus = '已支付'; // 如果不需要付USDT，直接成功
+        }
+
         await pool.query(
-            `INSERT INTO orders (order_id, user_id, product_name, payment_method, usdt_amount, cny_amount, shipping_info, wallet, expires_at) 
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW() + INTERVAL '30 minutes')`,
-            [orderId, userId, prodName, paymentMethod, finalUSDT.toFixed(4), cnyAmount, JSON.stringify(finalShippingInfo), wallet]
+            `INSERT INTO orders (order_id, user_id, product_name, payment_method, usdt_amount, cny_amount, status, shipping_info, wallet, expires_at) 
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW() + INTERVAL '30 minutes')`,
+            [orderId, userId, prodName, paymentMethod, finalUSDT.toFixed(4), cnyAmount, orderStatus, JSON.stringify(finalShippingInfo), wallet]
         );
 
-        let tgMsg = `🆕 <b>新订单提醒</b>\n\n单号: <code>${orderId}</code>\n用户: ${user ? user.contact : userId}\n联系: ${contactInfo}\n商品: ${prodName}\n支付: ${paymentMethod}\n金额: ${finalUSDT.toFixed(4)} USDT`;
-        if(paymentMethod !== 'USDT') tgMsg += `\n⚠️ <b>需要人工处理</b>`;
+        let tgMsg = `🆕 <b>新订单提醒</b>\n\n单号: <code>${orderId}</code>\n用户: ${user ? user.contact : userId}\n联系: ${contactInfo}\n商品: ${prodName}\n支付: ${paymentMethod}\n需付: ${finalUSDT.toFixed(4)} USDT`;
+        
+        if (finalUSDT <= 0) {
+            tgMsg += `\n✅ <b>余额全额抵扣，请直接发货</b>`;
+        } else if (paymentMethod !== 'USDT') {
+            tgMsg += `\n⚠️ <b>需要人工处理</b>`;
+        }
         sendTgNotify(tgMsg);
 
-        res.json({ success: true, orderId, usdtAmount: finalUSDT.toFixed(4), cnyAmount, wallet });
+        // 返回 status 给前端判断
+        res.json({ success: true, orderId, usdtAmount: finalUSDT.toFixed(4), cnyAmount, wallet, status: orderStatus });
 
     } catch(e) { console.error(e); res.json({success:false, msg: e.message}); }
 });
@@ -656,12 +717,18 @@ app.post('/api/order/confirm-payment', upload.single('file'), async (req, res) =
             return res.json({success:false, msg:'请选择图片'});
         }
 
-        await bot.sendPhoto(TG_ADMIN_GROUP_ID, req.file.buffer, {
-            caption: `📸 <b>收到支付凭证</b>\n单号: <code>${orderId}</code>\n用户ID: ${userId}\n请核对金额后在后台确认。`,
-            parse_mode: 'HTML'
-        });
+        try {
+            // [修改] 尝试发送到TG
+            await bot.sendPhoto(TG_ADMIN_GROUP_ID, req.file.buffer, {
+                caption: `📸 <b>收到支付凭证</b>\n单号: <code>${orderId}</code>\n用户ID: ${userId}\n请核对金额后在后台确认。`,
+                parse_mode: 'HTML'
+            });
+        } catch (tgErr) {
+            console.error("TG发送失败:", tgErr);
+            // 即使TG发送失败也允许用户提交，防止卡死，但记录日志
+        }
 
-        // 数据库 proof 字段仅标记为已发送，节省空间
+        // [修改] 确保状态更新为待审核，proof 字段只存标记，不存文件
         await pool.query("UPDATE orders SET proof = 'TG_SENT', status = '待审核' WHERE order_id = $1", [orderId]);
         res.json({success:true});
     } catch(e) { 
@@ -693,22 +760,32 @@ app.post('/api/withdraw', upload.single('file'), async (req, res) => {
         await pool.query('UPDATE users SET balance = balance - $1 WHERE id = $2', [amount, userId]);
 
         let logAddress = addressText;
-        if (req.file) {
+        if (req.file)
             logAddress = `[${method}] 收款码已发送`;
-            await bot.sendPhoto(TG_ADMIN_GROUP_ID, req.file.buffer, {
-                caption: `💸 <b>新提现申请 (${method})</b>\n用户: ${user.contact} (ID: ${userId})\n金额: ${amount} USDT\n账号: ${addressText}`,
-                parse_mode: 'HTML'
-            });
-        } else {
-            sendTgNotify(`💸 <b>新提现申请 (${method})</b>\n用户: ${user.contact} (ID: ${userId})\n金额: ${amount} USDT\n地址: <code>${addressText}</code>`);
-        }
 
-        await pool.query('INSERT INTO withdrawals (user_id, amount, address) VALUES ($1, $2, $3)', [userId, amount, logAddress]);
+        // [修改] 先插入数据库获取ID
+        const insertRes = await pool.query('INSERT INTO withdrawals (user_id, amount, address) VALUES ($1, $2, $3) RETURNING id', [userId, amount, logAddress]);
+        const withdrawId = insertRes.rows[0].id;
+
+        // [修改] 定义按钮
+        const options = {
+            caption: `💸 <b>新提现申请 (${method})</b>\n用户: ${user.contact} (ID: ${userId})\n金额: ${amount} USDT\n账号: ${addressText}\nID: ${withdrawId}`,
+            parse_mode: 'HTML',
+            reply_markup: {
+                inline_keyboard: [[
+                    { text: "✅ 已打款", callback_data: `wd_confirm_${withdrawId}_${userId}` },
+                    { text: "❌ 驳回", callback_data: `wd_reject_${withdrawId}_${userId}_${amount}` }
+                ]]
+            }
+        };
+
+        if (req.file) {
+            await bot.sendPhoto(TG_ADMIN_GROUP_ID, req.file.buffer, options);
+        } else {
+            await bot.sendMessage(TG_ADMIN_GROUP_ID, options.caption, options);
+        }
         
         res.json({ success: true });
-    } catch (e) {
-        console.error(e);
-        res.json({ success: false, msg: 'Error' });
     }
 });
 
