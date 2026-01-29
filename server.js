@@ -164,18 +164,25 @@ const initDB = async () => {
 
 initDB();
 
-// 🕒 定时任务：每天凌晨0点清理3天前的旧订单 (保留用户、商品、招聘数据)
+// 🕒 定时任务：每天凌晨0点清理3天前的旧数据
 cron.schedule('0 0 * * *', async () => {
     try {
-        console.log('🔄 开始清理旧订单...');
-        // 删除创建时间超过3天的订单记录
+        console.log('🔄 开始每日数据清理...');
+        
+        // 1. 清理旧订单
         await pool.query("DELETE FROM orders WHERE created_at < NOW() - INTERVAL '3 days'");
-        console.log('✅ 旧订单清理完成');
+        
+        // 2. 清理旧提现记录 (新增)
+        await pool.query("DELETE FROM withdrawals WHERE created_at < NOW() - INTERVAL '3 days'");
+        
+        // 3. 清理旧聊天记录 (新增)
+        await pool.query("DELETE FROM chats WHERE created_at < NOW() - INTERVAL '3 days'");
+
+        console.log('✅ 所有旧数据清理完成 (订单/提现/聊天)');
     } catch (e) {
         console.error('❌ 清理失败:', e);
     }
 });
-
 // ☁️ 辅助函数：上传图片到 Cloudinary
 const uploadToCloud = (buffer) => {
     return new Promise((resolve, reject) => {
