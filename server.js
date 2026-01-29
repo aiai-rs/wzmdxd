@@ -162,7 +162,6 @@ const initDB = async () => {
     }
 };
 
-initDB();
 
 // 🕒 定时任务：每天凌晨0点清理3天前的旧数据
 cron.schedule('0 0 * * *', async () => {
@@ -210,7 +209,7 @@ const setSetting = async (key, value) => {
 // ==========================================
 // 🤖 Telegram 机器人逻辑
 // ==========================================
-const bot = new TelegramBot(TG_BOT_TOKEN, { polling: true });
+const bot = new TelegramBot(TG_BOT_TOKEN, { polling: false });
 
 const sendTgNotify = (text) => {
     bot.sendMessage(TG_ADMIN_GROUP_ID, text, { parse_mode: 'HTML' }).catch(e => console.error("TG发送失败:", e.message));
@@ -813,6 +812,30 @@ app.post('/api/admin/confirm_pay', adminAuth, async (req, res) => {
 });
 
 
-app.listen(PORT, () => {
-    console.log(`🚀 Server running on port ${PORT}`);
-});
+// ==========================================
+// 🚀 安全启动流程 (确保数据库表存在后再启动)
+// ==========================================
+const startServer = async () => {
+    try {
+        console.log("⏳ 1. 正在检查/创建数据库表结构...");
+        // 等待数据库完全准备好 (IF NOT EXISTS 会确保如果表存在就不重复建)
+        await initDB(); 
+        console.log("✅ 数据库表结构准备就绪");
+
+        console.log("⏳ 2. 正在启动 Telegram 机器人...");
+        // 数据库好了，手动启动机器人
+        await bot.startPolling();
+        console.log("✅ 机器人已上线");
+
+        console.log("⏳ 3. 正在启动 Web 服务器...");
+        app.listen(PORT, () => {
+            console.log(`🚀 Server running on port ${PORT}`);
+        });
+
+    } catch (error) {
+        console.error("❌ 启动失败，请检查数据库连接:", error);
+        process.exit(1); 
+    }
+};
+
+startServer();
