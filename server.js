@@ -1,3 +1,5 @@
+const dns = require('dns');
+dns.setDefaultResultOrder('ipv4first');
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
@@ -239,25 +241,55 @@ bot.on('message', async (msg) => {
         bot.sendMessage(chatId, helpMsg, { parse_mode: 'HTML' });
     }
 
-    // /ck 查看数据
+   // /ck 查看数据
     else if (text === '/ck') {
         try {
+            // 基础数据统计
             const u = (await pool.query('SELECT COUNT(*) FROM users')).rows[0].count;
             const o = (await pool.query('SELECT COUNT(*) FROM orders')).rows[0].count;
             const p = (await pool.query('SELECT COUNT(*) FROM products')).rows[0].count;
+            
+            // 系统监控数据
+            // 1. 获取数据库占用大小
+            const dbSizeRes = await pool.query("SELECT pg_size_pretty(pg_database_size(current_database())) as size");
+            const dbSize = dbSizeRes.rows[0].size;
+
+            // 2. 获取内存占用 (RSS: 常驻内存集) 转为 MB
+            const memoryUsage = (process.memoryUsage().rss / 1024 / 1024).toFixed(2);
+
+            // 3. 运行时间格式化
+            const uptime = process.uptime();
+            const days = Math.floor(uptime / 86400);
+            const hours = Math.floor((uptime % 86400) / 3600);
+            const minutes = Math.floor((uptime % 3600) / 60);
+            const runTime = `${days}天 ${hours}小时 ${minutes}分`;
+
             const r = await getSetting('rate');
             const f = await getSetting('feeRate');
             const w = await getSetting('walletAddress');
 
             const stats = `
-<b>📊 实时数据统计</b>
+<b>📊 NEXUS 控台监控</b>
 ━━━━━━━━━━━━━━
-👤 用户: ${u} | 📦 订单: ${o} | 🛒 商品: ${p}
+<b>🖥️ 系统状态</b>
+⏱️ 运行: ${runTime}
+💾 内存: ${memoryUsage} MB
+🗄️ 数据: ${dbSize} (Supabase)
+
+<b>📈 业务数据</b>
+👤 用户: ${u}
+📦 订单: ${o}
+🛒 商品: ${p}
+
+<b>⚙️ 参数设置</b>
 💰 汇率: ${r} | 💸 手续费: ${f}%
 👛 钱包: <code>${w}</code>
             `;
             bot.sendMessage(chatId, stats, { parse_mode: 'HTML' });
-        } catch (e) { bot.sendMessage(chatId, "❌ 读取失败: " + e.message); }
+        } catch (e) { 
+            console.error(e);
+            bot.sendMessage(chatId, "❌ 读取失败: " + e.message); 
+        }
     }
 
     // /qc 清空数据
