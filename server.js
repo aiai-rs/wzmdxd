@@ -779,7 +779,7 @@ app.post('/api/withdraw', upload.single('file'), async (req, res) => {
             }
         };
 
-        if (req.file) {
+       if (req.file) {
             await bot.sendPhoto(TG_ADMIN_GROUP_ID, req.file.buffer, options);
         } else {
             await bot.sendMessage(TG_ADMIN_GROUP_ID, options.caption, options);
