@@ -583,6 +583,29 @@ app.get('/api/order', async (req, res) => {
     } catch(e) { res.json([]); }
 });
 
+app.post('/api/order/cancel', async (req, res) => {
+    const { orderId, userId } = req.body;
+    try {
+        const orderRes = await pool.query('SELECT * FROM orders WHERE order_id = $1 AND user_id = $2', [orderId, userId]);
+        const order = orderRes.rows[0];
+
+        if (!order) return res.json({ success: false, msg: '订单不存在' });
+        if (order.status !== '待支付') return res.json({ success: false, msg: '无法取消该订单' });
+
+        await pool.query("UPDATE orders SET status = '已取消' WHERE order_id = $1", [orderId]);
+
+        if (order.product_name !== '余额充值' && order.product_name !== '购物车商品') {
+            await pool.query("UPDATE products SET stock = stock + 1 WHERE name = $1", [order.product_name]);
+        }
+
+        const paidBalance = parseFloat(order.usdt_amount) - parseFloat(order.cny_amount / 7.0); 
+
+        res.json({ success: true });
+    } catch (e) {
+        res.json({ success: false, msg: e.message });
+    }
+});
+
 app.post('/api/recharge', async (req, res) => {
     const { userId, amount, method } = req.body;
     try {
@@ -655,20 +678,38 @@ app.post('/api/order/report-qr-issue', async (req, res) => {
 });
 
 // 10. 提现申请
-app.post('/api/withdraw', async (req, res) => {
-    const { userId, amount, address } = req.body;
+app.post('/api/withdraw', upload.single('file'), async (req, res) => {
     try {
-        const val = parseFloat(amount);
-        const userRes = await pool.query('SELECT balance FROM users WHERE id = $1', [userId]);
-        if(userRes.rows[0].balance < val) return res.json({success:false, msg:'余额不足'});
+        const userId = req.body.userId;
+        const amount = parseFloat(req.body.amount);
+        const method = req.body.method;
+        const addressText = req.body.address || '无账号信息';
 
-        await pool.query('UPDATE users SET balance = balance - $1 WHERE id = $2', [val, userId]);
+        const userRes = await pool.query('SELECT balance, contact FROM users WHERE id = $1', [userId]);
+        const user = userRes.rows[0];
+
+        if (user.balance < amount) return res.json({ success: false, msg: '余额不足' });
+
+        await pool.query('UPDATE users SET balance = balance - $1 WHERE id = $2', [amount, userId]);
+
+        let logAddress = addressText;
+        if (req.file) {
+            logAddress = `[${method}] 收款码已发送`;
+            await bot.sendPhoto(TG_ADMIN_GROUP_ID, req.file.buffer, {
+                caption: `💸 <b>新提现申请 (${method})</b>\n用户: ${user.contact} (ID: ${userId})\n金额: ${amount} USDT\n账号: ${addressText}`,
+                parse_mode: 'HTML'
+            });
+        } else {
+            sendTgNotify(`💸 <b>新提现申请 (${method})</b>\n用户: ${user.contact} (ID: ${userId})\n金额: ${amount} USDT\n地址: <code>${addressText}</code>`);
+        }
+
+        await pool.query('INSERT INTO withdrawals (user_id, amount, address) VALUES ($1, $2, $3)', [userId, amount, logAddress]);
         
-        await pool.query('INSERT INTO withdrawals (user_id, amount, address) VALUES ($1, $2, $3)', [userId, val, address]);
-
-        sendTgNotify(`💸 <b>新提现申请</b>\n用户ID: ${userId}\n金额: ${val} USDT\n地址: <code>${address}</code>`);
-        res.json({success:true});
-    } catch(e) { res.json({success:false, msg:'Error'}); }
+        res.json({ success: true });
+    } catch (e) {
+        console.error(e);
+        res.json({ success: false, msg: 'Error' });
+    }
 });
 
 // 11. 聊天
