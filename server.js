@@ -786,6 +786,9 @@ app.post('/api/withdraw', upload.single('file'), async (req, res) => {
         }
         
         res.json({ success: true });
+    } catch (e) {
+        console.error(e);
+        res.json({ success: false, msg: 'Error' });
     }
 });
 
