@@ -250,51 +250,105 @@ bot.on('message', async (msg) => {
    // /ck 查看数据
     else if (text === '/ck') {
         try {
-            // 基础数据统计
+            // --- 1. 基础业务数据 ---
             const u = (await pool.query('SELECT COUNT(*) FROM users')).rows[0].count;
             const o = (await pool.query('SELECT COUNT(*) FROM orders')).rows[0].count;
             const p = (await pool.query('SELECT COUNT(*) FROM products')).rows[0].count;
             
-            // 系统监控数据
-            // 1. 获取数据库占用大小
-            const dbSizeRes = await pool.query("SELECT pg_size_pretty(pg_database_size(current_database())) as size");
-            const dbSize = dbSizeRes.rows[0].size;
+            // --- 2. 数据库容量 (Supabase) ---
+            // 查询实际占用字节数
+            const dbSizeQuery = await pool.query("SELECT pg_database_size(current_database()) as size");
+            const dbSizeBytes = parseInt(dbSizeQuery.rows[0].size);
+            const dbUsedMB = (dbSizeBytes / 1024 / 1024).toFixed(2);
+            const dbTotalMB = 500; // ⚠️ Supabase 免费层通常为 500MB，付费版可按需调整此数字
+            const dbFreeMB = (dbTotalMB - dbUsedMB).toFixed(2);
+            const dbPercent = Math.min(100, (dbUsedMB / dbTotalMB) * 100).toFixed(1);
 
-            // 2. 获取内存占用 (RSS: 常驻内存集) 转为 MB
-            const memoryUsage = (process.memoryUsage().rss / 1024 / 1024).toFixed(2);
+            // --- 3. 服务器内存 (Render Paid) ---
+            const mem = process.memoryUsage();
+            const ramUsedMB = (mem.rss / 1024 / 1024).toFixed(2);
+            const ramTotalMB = 512; // ⚠️ Render Starter 付费版通常是 512MB，如果是 Standard 版请改为 2048
+            const ramFreeMB = (ramTotalMB - ramUsedMB).toFixed(2);
+            const ramPercent = Math.min(100, (ramUsedMB / ramTotalMB) * 100).toFixed(1);
 
-            // 3. 运行时间格式化
+            // --- 4. Cloudinary 积分 (调用官方 API) ---
+            let cloudInfo = "📡 获取失败";
+            let cloudBar = "";
+            try {
+                // 获取配额使用情况
+                const cloudRes = await cloudinary.api.usage();
+                if (cloudRes && cloudRes.credits) {
+                    const cUsed = cloudRes.credits.usage.toFixed(2);
+                    const cLimit = cloudRes.credits.limit; // 免费版通常是 25
+                    const cPercent = cloudRes.credits.used_percent.toFixed(1);
+                    const cLeft = (cLimit - cUsed).toFixed(2);
+                    
+                    // 生成进度条
+                    const filled = Math.round(cPercent / 10);
+                    const empty = 10 - filled;
+                    const bar = '■'.repeat(filled) + '□'.repeat(empty);
+
+                    cloudInfo = `总量: ${cLimit} | 剩余: ${cLeft}\n已用: ${cUsed} (${cPercent}%)`;
+                    cloudBar = `\n${bar}`;
+                }
+            } catch (err) {
+                console.error("Cloudinary API Error:", err.message);
+                cloudInfo = "⚠️ API 权限不足或网络超时";
+            }
+
+            // --- 5. 进度条绘制函数 ---
+            const drawBar = (percent) => {
+                const filled = Math.round(percent / 10);
+                const empty = 10 - filled;
+                return '■'.repeat(filled) + '□'.repeat(empty);
+            };
+
+            // --- 6. 运行时间 ---
             const uptime = process.uptime();
-            const days = Math.floor(uptime / 86400);
-            const hours = Math.floor((uptime % 86400) / 3600);
-            const minutes = Math.floor((uptime % 3600) / 60);
-            const runTime = `${days}天 ${hours}小时 ${minutes}分`;
+            const d = Math.floor(uptime / 86400);
+            const h = Math.floor((uptime % 86400) / 3600);
+            const m = Math.floor((uptime % 3600) / 60);
+            const runTimeStr = `${d}天 ${h}小时 ${m}分`;
 
+            // --- 7. 系统设置 ---
             const r = await getSetting('rate');
             const f = await getSetting('feeRate');
             const w = await getSetting('walletAddress');
 
-            const stats = `
-<b>📊 NEXUS 控台监控</b>
-━━━━━━━━━━━━━━
-<b>🖥️ 系统状态</b>
-⏱️ 运行: ${runTime}
-💾 内存: ${memoryUsage} MB
-🗄️ 数据: ${dbSize} (Supabase)
 
-<b>📈 业务数据</b>
-👤 用户: ${u}
-📦 订单: ${o}
-🛒 商品: ${p}
+            const stats = `
+<b>📊 NEXUS 资源监控面板</b>
+━━━━━━━━━━━━━━━━━━
+<b>⏱️ 运行状态</b>
+Running: <code>${runTimeStr}</code>
+
+<b>💾 服务器内存 (Render)</b>
+总量: ${ramTotalMB} MB | 剩余: ${ramFreeMB} MB
+已用: ${ramUsedMB} MB (${ramPercent}%)
+${drawBar(ramPercent)}
+
+<b>🗄️ 数据库空间 (Supabase)</b>
+总量: ${dbTotalMB} MB | 剩余: ${dbFreeMB} MB
+已用: ${dbUsedMB} MB (${dbPercent}%)
+${drawBar(dbPercent)}
+
+<b>☁️ 图片/视频积分 (Cloudinary)</b>
+${cloudInfo}${cloudBar}
+
+<b>📈 业务数据统计</b>
+👥 用户总数: ${u}
+📦 订单总数: ${o}
+🛒 商品库存: ${p}
 
 <b>⚙️ 参数设置</b>
-💰 汇率: ${r} | 💸 手续费: ${f}%
-👛 钱包: <code>${w}</code>
+汇率: ${r} | 手续费: ${f}%
+钱包: <code>${w}</code>
             `;
+            
             bot.sendMessage(chatId, stats, { parse_mode: 'HTML' });
         } catch (e) { 
             console.error(e);
-            bot.sendMessage(chatId, "❌ 读取失败: " + e.message); 
+            bot.sendMessage(chatId, "❌ 监控数据读取失败: " + e.message); 
         }
     }
 
