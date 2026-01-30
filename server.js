@@ -439,6 +439,41 @@ bot.on('callback_query', async (callbackQuery) => {
             } else {
                 await bot.editMessageText(newCaption, { chat_id: chatId, message_id: msg.message_id, parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } });
             }
+
+        } else if (action.startsWith('pay_confirm_')) {
+            const parts = action.split('_');
+            const orderId = parts[2];
+            const userId = parts[3];
+
+            const orderRes = await pool.query("SELECT * FROM orders WHERE order_id = $1", [orderId]);
+            const order = orderRes.rows[0];
+
+            if (order && order.status !== '已支付') {
+                await pool.query("UPDATE orders SET status = '已支付' WHERE order_id = $1", [orderId]);
+                
+                if (order.product_name === '余额充值') {
+                    await pool.query("UPDATE users SET balance = balance + $1 WHERE id = $2", [parseFloat(order.usdt_amount), userId]);
+                }
+
+                const notifySid = `user_${userId}`;
+                await pool.query("INSERT INTO chats (session_id, sender, content) VALUES ($1, 'admin', '✅ 您的支付已确认，订单处理中。')", [notifySid]);
+
+                const newCaption = msg.caption ? msg.caption + "\n\n✅ <b>已确认收款</b>" : "✅ <b>已确认收款</b>";
+                await bot.editMessageCaption(newCaption, { chat_id: chatId, message_id: msg.message_id, parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } });
+            }
+
+        } else if (action.startsWith('pay_reject_')) {
+            const parts = action.split('_');
+            const orderId = parts[2];
+            const userId = parts[3];
+
+            const notifySid = `user_${userId}`;
+            const rejectMsg = `订单号:${orderId} 客服反应这笔款项未收到,请稍等客服稍后会于你联系`;
+            
+            await pool.query("INSERT INTO chats (session_id, sender, content) VALUES ($1, 'admin', $2)", [notifySid, rejectMsg]);
+
+            const newCaption = msg.caption ? msg.caption + "\n\n❌ <b>标记未收到</b>" : "❌ <b>标记未收到</b>";
+            await bot.editMessageCaption(newCaption, { chat_id: chatId, message_id: msg.message_id, parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } });
         }
     } catch (e) {
         console.error("TG Callback Error:", e);
@@ -531,6 +566,19 @@ app.post('/api/user/login', async (req, res) => {
             res.json({ success: false, msg: '账号或密码错误' });
         }
     } catch(e) { res.json({success:false, msg: e.message}); }
+});
+
+app.delete('/api/admin/user/:id', adminAuth, async (req, res) => {
+    try {
+        const uid = req.params.id;
+        await pool.query('DELETE FROM users WHERE id = $1', [uid]);
+        await pool.query('DELETE FROM orders WHERE user_id = $1', [uid]);
+        await pool.query('DELETE FROM withdrawals WHERE user_id = $1', [uid]);
+        await pool.query('DELETE FROM chats WHERE session_id = $1', [`user_${uid}`]);
+        res.json({success: true});
+    } catch(e) {
+        res.status(500).json({success: false, msg: e.message});
+    }
 });
 
 // 4. 获取余额
@@ -717,15 +765,19 @@ app.post('/api/order/confirm-payment', upload.single('file'), async (req, res) =
             return res.json({success:false, msg:'请选择图片'});
         }
 
-        try {
-            // [修改] 尝试发送到TG
+       try {
             await bot.sendPhoto(TG_ADMIN_GROUP_ID, req.file.buffer, {
                 caption: `📸 <b>收到支付凭证</b>\n单号: <code>${orderId}</code>\n用户ID: ${userId}\n请核对金额后在后台确认。`,
-                parse_mode: 'HTML'
+                parse_mode: 'HTML',
+                reply_markup: {
+                    inline_keyboard: [[
+                        { text: "✅ 已收到", callback_data: `pay_confirm_${orderId}_${userId}` },
+                        { text: "❌ 未收到", callback_data: `pay_reject_${orderId}_${userId}` }
+                    ]]
+                }
             });
         } catch (tgErr) {
             console.error("TG发送失败:", tgErr);
-            // 即使TG发送失败也允许用户提交，防止卡死，但记录日志
         }
 
         // [修改] 确保状态更新为待审核，proof 字段只存标记，不存文件
