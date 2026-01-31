@@ -94,6 +94,17 @@ const initDB = async () => {
         
         // 1. 用户表
         await client.query(`
+            CREATE TABLE IF NOT EXISTS users (
+                id BIGINT PRIMARY KEY,
+                contact TEXT NOT NULL,
+                password TEXT NOT NULL,
+                balance NUMERIC(10, 4) DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        `);
+
+        // 2. 订单表
+        await client.query(`
             CREATE TABLE IF NOT EXISTS orders (
                 order_id TEXT PRIMARY KEY,
                 user_id BIGINT,
@@ -112,6 +123,7 @@ const initDB = async () => {
             );
         `);
 
+        // 3. 提现表
         await client.query(`
             CREATE TABLE IF NOT EXISTS withdrawals (
                 id SERIAL PRIMARY KEY,
@@ -123,7 +135,7 @@ const initDB = async () => {
             );
         `);
 
-        // 2. 商品表
+        // 4. 商品表
         await client.query(`
             CREATE TABLE IF NOT EXISTS products (
                 id BIGINT PRIMARY KEY,
@@ -138,26 +150,7 @@ const initDB = async () => {
             );
         `);
 
-        await client.query(`
-            CREATE TABLE IF NOT EXISTS orders (
-                order_id TEXT PRIMARY KEY,
-                user_id BIGINT,
-                product_name TEXT,
-                payment_method TEXT,
-                usdt_amount NUMERIC(10, 4),
-                cny_amount NUMERIC(10, 2),
-                status TEXT DEFAULT '待支付',
-                shipping_info TEXT,
-                tracking_number TEXT,
-                qrcode_url TEXT,
-                proof TEXT,
-                wallet TEXT, 
-                expires_at TIMESTAMP,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        `);
-
-        // 4. 招聘表
+        // 5. 招聘表
         await client.query(`
             CREATE TABLE IF NOT EXISTS hiring (
                 id SERIAL PRIMARY KEY,
@@ -167,20 +160,21 @@ const initDB = async () => {
             );
         `);
 
-        // 5. 聊天记录表
+        // 6. 聊天记录表 (已包含 msg_type)
         await client.query(`
             CREATE TABLE IF NOT EXISTS chats (
                 id SERIAL PRIMARY KEY,
                 session_id TEXT NOT NULL,
                 sender TEXT,
                 content TEXT,
+                msg_type TEXT,
                 is_read BOOLEAN DEFAULT FALSE,
                 is_initiate BOOLEAN DEFAULT FALSE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         `);
 
-        // 6. 系统设置表 (KV存储)
+        // 7. 系统设置表 (KV存储)
         await client.query(`
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
@@ -445,10 +439,10 @@ ${cloudInfo}${cloudBar}
     else if (text === '/fix_db') {
         try {
             await pool.query('ALTER TABLE orders ADD COLUMN IF NOT EXISTS wallet TEXT;');
+            await pool.query('ALTER TABLE chats ADD COLUMN IF NOT EXISTS msg_type TEXT;');
             bot.sendMessage(chatId, "✅ 数据库字段修复完成");
         } catch(e) { bot.sendMessage(chatId, "❌ " + e.message); }
     }
-});
 
 bot.on('callback_query', async (callbackQuery) => {
     const action = callbackQuery.data;
@@ -1026,27 +1020,23 @@ app.post('/api/admin/user/balance', adminAuth, async (req, res) => {
 
 app.post('/api/admin/chat/initiate', adminAuth, async (req, res) => {
     const sid = `user_${req.body.userId}`;
-    const content = '客服已接入';
-    
     try {
         await pool.query("ALTER TABLE chats ADD COLUMN IF NOT EXISTS msg_type TEXT DEFAULT 'text'");
-
-        const result = await pool.query(
-            "INSERT INTO chats (session_id, sender, content, is_initiate) VALUES ($1, 'admin', $2, TRUE) RETURNING created_at", 
-            [sid, content]
-        );
-
-        io.to(sid).emit('new_message', {
-            session_id: sid,
-            sender: 'admin',
-            content: content,
+        
+        const result = await pool.query("INSERT INTO chats (session_id, sender, content, msg_type, is_initiate) VALUES ($1, 'admin', '客服已接入', 'text', TRUE) RETURNING created_at", [sid]);
+        
+        io.to(sid).emit('new_message', { 
+            session_id: sid, 
+            sender: 'admin', 
+            content: '客服已接入', 
             msg_type: 'text',
             created_at: result.rows[0].created_at
         });
 
         res.json({success:true, sessionId: sid});
-    } catch(e) {
-        res.json({success:false, msg: e.message});
+    } catch (e) {
+        console.error(e);
+        res.status(500).json({success:false, msg: e.message});
     }
 });
 
