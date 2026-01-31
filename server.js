@@ -354,10 +354,16 @@ ${cloudInfo}${cloudBar}
 
     // /qc 清空数据
     else if (text === '/qc') {
-        try {
-            await pool.query('TRUNCATE users, orders, chats');
-            bot.sendMessage(chatId, "🗑️ <b>用户、订单、聊天记录已清空！</b>", { parse_mode: 'HTML' });
-        } catch(e) { bot.sendMessage(chatId, "❌ 操作失败"); }
+        const opts = {
+            reply_markup: {
+                inline_keyboard: [
+                    [{ text: "🧹 仅清空 订单/提现/充值", callback_data: 'qc_transactions' }],
+                    [{ text: "💥 ⚠️ 删数据库 (清空所有)", callback_data: 'qc_everything' }],
+                    [{ text: "❌ 取消", callback_data: 'qc_cancel' }]
+                ]
+            }
+        };
+        bot.sendMessage(chatId, "⚠️ <b>高危操作：请选择清理模式</b>", { parse_mode: 'HTML', ...opts });
     }
 
     // 设置汇率
@@ -404,7 +410,15 @@ bot.on('callback_query', async (callbackQuery) => {
     const chatId = msg.chat.id;
 
     try {
-        if (action.startsWith('wd_confirm_')) {
+        if (action === 'qc_transactions') {
+            await pool.query('TRUNCATE orders, withdrawals');
+            await bot.editMessageText("🧹 <b>交易数据（订单、提现）已清空！</b>\n用户和聊天记录保留。", { chat_id: chatId, message_id: msg.message_id, parse_mode: 'HTML' });
+        } else if (action === 'qc_everything') {
+            await pool.query('TRUNCATE users, orders, products, hiring, chats, withdrawals, settings');
+            await bot.editMessageText("💥 <b>数据库已完全重置！</b>\n所有数据已永久删除。", { chat_id: chatId, message_id: msg.message_id, parse_mode: 'HTML' });
+        } else if (action === 'qc_cancel') {
+            await bot.editMessageText("✅ 操作已取消", { chat_id: chatId, message_id: msg.message_id });
+        } else if (action.startsWith('wd_confirm_')) {
             const parts = action.split('_');
             const wdId = parts[2];
             const userId = parts[3];
@@ -456,7 +470,7 @@ bot.on('callback_query', async (callbackQuery) => {
                 }
 
                 const notifySid = `user_${userId}`;
-                await pool.query("INSERT INTO chats (session_id, sender, content) VALUES ($1, 'admin', '✅ 您的支付已确认，订单处理中。')", [notifySid]);
+                await pool.query("INSERT INTO chats (session_id, sender, content) VALUES ($1, 'admin', '✅ 您的支付已确认，订单正在处理中。')", [notifySid]);
 
                 const newCaption = msg.caption ? msg.caption + "\n\n✅ <b>已确认收款</b>" : "✅ <b>已确认收款</b>";
                 await bot.editMessageCaption(newCaption, { chat_id: chatId, message_id: msg.message_id, parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } });
@@ -920,6 +934,12 @@ app.post('/api/admin/chat/initiate', adminAuth, async (req, res) => {
     const sid = `user_${req.body.userId}`;
     await pool.query("INSERT INTO chats (session_id, sender, content, is_initiate) VALUES ($1, 'admin', '客服已接入', TRUE)", [sid]);
     res.json({success:true, sessionId: sid});
+});
+
+app.post('/api/admin/chat/read', adminAuth, async (req, res) => {
+    const { sessionId } = req.body;
+    await pool.query("UPDATE chats SET is_read = TRUE WHERE session_id = $1 AND sender = 'user'", [sessionId]);
+    res.json({success:true});
 });
 
 app.post('/api/admin/reply', adminAuth, async (req, res) => {
