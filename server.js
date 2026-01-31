@@ -552,19 +552,21 @@ bot.on('callback_query', async (callbackQuery) => {
                 await bot.editMessageCaption(newCaption, { chat_id: chatId, message_id: msg.message_id, parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } });
             }
 
-        // ================= 支付驳回 =================
+// ================= 支付驳回 (修改版) =================
         } else if (action.startsWith('pay_reject_')) {
             const parts = action.split('_');
             const orderId = parts[2];
             const userId = parts[3];
 
+            await pool.query("UPDATE orders SET status = '待支付', proof = NULL WHERE order_id = $1", [orderId]);
+
             const notifySid = `user_${userId}`;
-            const rejectMsg = `订单号:${orderId} 客服反应这笔款项未收到,请稍等客服稍后会于你联系`;
+            const rejectMsg = `❌ 订单 ${orderId} 支付核实失败。\n原因：客服反应这笔款项未收到,请稍等客服稍后会于你联系。\n订单状态已重置，请核对后重新上传凭证。`;
             
-            // 🟢 1. 插入时获取时间
+            // 2. 插入聊天记录
             const resDb = await pool.query("INSERT INTO chats (session_id, sender, content, msg_type) VALUES ($1, 'admin', $2, 'text') RETURNING created_at", [notifySid, rejectMsg]);
 
-            // 🟢 2. [新增] 立即广播给前端
+            // 3. Socket 广播通知前端
             io.to(notifySid).emit('new_message', { 
                 session_id: notifySid, 
                 sender: 'admin', 
@@ -573,7 +575,7 @@ bot.on('callback_query', async (callbackQuery) => {
                 created_at: resDb.rows[0].created_at 
             });
 
-            const newCaption = msg.caption ? msg.caption + "\n\n❌ <b>标记未收到</b>" : "❌ <b>标记未收到</b>";
+            const newCaption = msg.caption ? msg.caption + "\n\n❌ <b>已驳回 (重置为待支付)</b>" : "❌ <b>已驳回</b>";
             await bot.editMessageCaption(newCaption, { chat_id: chatId, message_id: msg.message_id, parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } });
         }
     } catch (e) {
