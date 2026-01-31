@@ -15,6 +15,7 @@ const stream = require('stream');
 const cron = require('node-cron');
 
 const app = express();
+app.set('trust proxy', 1);
 const server = http.createServer(app); // 将 app 包装进 http server
 // 初始化 Socket.io，允许跨域
 const io = new Server(server, {
