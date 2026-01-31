@@ -1,6 +1,8 @@
 const dns = require('dns');
 dns.setDefaultResultOrder('ipv4first');
 const express = require('express');
+const http = require('http'); // 新增
+const { Server } = require("socket.io"); // 新增
 const cors = require('cors');
 const bodyParser = require('body-parser');
 const multer = require('multer');
@@ -13,9 +15,36 @@ const stream = require('stream');
 const cron = require('node-cron');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const server = http.createServer(app); // 将 app 包装进 http server
+// 初始化 Socket.io，允许跨域
+const io = new Server(server, {
+    cors: {
+        origin: "*",
+        methods: ["GET", "POST"]
+    }
+});
 
-const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN; 
+const PORT = process.env.PORT || 3000;
+const rateLimit = require('express-rate-limit');
+
+// 定义登录限流器：15分钟内最多尝试5次
+const loginLimiter = rateLimit({
+	windowMs: 15 * 60 * 1000, 
+	max: 5, 
+	message: { success: false, msg: "尝试次数过多，请15分钟后再试" },
+    standardHeaders: true,
+	legacyHeaders: false,
+});
+
+// 定义全局限流器：1分钟最多200次请求 (防止DDoS)
+const apiLimiter = rateLimit({
+	windowMs: 1 * 60 * 1000, 
+	max: 200, 
+    standardHeaders: true,
+	legacyHeaders: false,
+});
+
+const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN;
 const TG_ADMIN_GROUP_ID = process.env.TG_ADMIN_GROUP_ID; 
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN;
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -35,6 +64,22 @@ if (!TG_BOT_TOKEN || !TG_ADMIN_GROUP_ID || !ADMIN_TOKEN || !DATABASE_URL) {
     console.error("❌ 错误: 环境变量缺失。请检查 TG_BOT_TOKEN, TG_ADMIN_GROUP_ID, ADMIN_TOKEN, DATABASE_URL");
     process.exit(1);
 }
+// ==========================================
+// 🔌 Socket.io 连接逻辑
+// ==========================================
+io.on('connection', (socket) => {
+    console.log('用户已连接:', socket.id);
+
+    // 客户端加入房间 (房间号就是 session_id)
+    socket.on('join_room', (room) => {
+        socket.join(room);
+        console.log(`Socket ${socket.id} 加入房间: ${room}`);
+    });
+
+    socket.on('disconnect', () => {
+        console.log('用户断开连接:', socket.id);
+    });
+});
 
 
 const pool = new Pool({
@@ -510,11 +555,16 @@ app.use(bodyParser.json({ limit: '50mb' }));
 app.use(bodyParser.urlencoded({ limit: '50mb', extended: true }));
 app.use(express.static('public'));
 
+// 应用全局限流
+app.use('/api/', apiLimiter);
+// 特别应用登录限流
+app.use('/api/user/login', loginLimiter);
+
 if (!fs.existsSync('uploads')) fs.mkdirSync('uploads');
 
 const upload = multer({ 
     storage: multer.memoryStorage(),
-    limits: { fileSize: 5 * 1024 * 1024 }
+    limits: { fileSize: 3 * 1024 * 1024 }
 });
 
 const adminAuth = (req, res, next) => {
@@ -629,20 +679,29 @@ app.post('/api/user/change-password', async (req, res) => {
 app.post('/api/order', async (req, res) => {
     const { userId, productId, paymentMethod, shippingInfo, useBalance, balanceAmount, contactInfo } = req.body;
     
+    // 获取一个独立的客户端连接以进行事务处理
+    const client = await pool.connect();
+
     try {
-        const userRes = await pool.query('SELECT * FROM users WHERE id = $1', [userId]);
+        await client.query('BEGIN'); // 开启事务
+
+        const userRes = await client.query('SELECT * FROM users WHERE id = $1', [userId]);
         const user = userRes.rows[0];
         
         let prodName = "购物车商品";
         let amount = 0;
 
         if (productId !== 'cart') {
-            const prodRes = await pool.query('SELECT * FROM products WHERE id = $1', [productId]);
+            const prodRes = await client.query('SELECT * FROM products WHERE id = $1', [productId]);
             const prod = prodRes.rows[0];
             if(prod) {
+                // 检查库存防止超卖
+                if (prod.stock <= 0) {
+                    throw new Error('商品库存不足');
+                }
                 prodName = prod.name;
                 amount = parseFloat(prod.price);
-                await pool.query('UPDATE products SET stock = stock - 1 WHERE id = $1', [productId]);
+                await client.query('UPDATE products SET stock = stock - 1 WHERE id = $1', [productId]);
             }
         } else {
             amount = req.body.totalAmount || 10; 
@@ -652,7 +711,8 @@ app.post('/api/order', async (req, res) => {
         if(useBalance && user && parseFloat(user.balance) > 0) {
             const deduct = Math.min(parseFloat(user.balance), amount);
             finalUSDT -= deduct;
-            await pool.query('UPDATE users SET balance = balance - $1 WHERE id = $2', [deduct, userId]);
+            // 使用事务客户端扣款
+            await client.query('UPDATE users SET balance = balance - $1 WHERE id = $2', [deduct, userId]);
         }
 
         const rate = parseFloat(await getSetting('rate'));
@@ -663,19 +723,20 @@ app.post('/api/order', async (req, res) => {
         const wallet = await getSetting('walletAddress');
         const finalShippingInfo = { ...shippingInfo, contact_method: contactInfo };
 
-        // [修改] 判断是否全额余额抵扣
         let orderStatus = '待支付';
-        let proofStatus = null;
         
         if (finalUSDT <= 0) {
-            orderStatus = '已支付'; // 如果不需要付USDT，直接成功
+            orderStatus = '已支付'; 
         }
 
-        await pool.query(
+        // 使用事务客户端插入订单
+        await client.query(
             `INSERT INTO orders (order_id, user_id, product_name, payment_method, usdt_amount, cny_amount, status, shipping_info, wallet, expires_at) 
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW() + INTERVAL '30 minutes')`,
             [orderId, userId, prodName, paymentMethod, finalUSDT.toFixed(4), cnyAmount, orderStatus, JSON.stringify(finalShippingInfo), wallet]
         );
+
+        await client.query('COMMIT'); // 提交事务：只有到这里没报错，扣款和订单才会生效
 
         let tgMsg = `🆕 <b>新订单提醒</b>\n\n单号: <code>${orderId}</code>\n用户: ${user ? user.contact : userId}\n联系: ${contactInfo}\n商品: ${prodName}\n支付: ${paymentMethod}\n需付: ${finalUSDT.toFixed(4)} USDT`;
         
@@ -686,10 +747,15 @@ app.post('/api/order', async (req, res) => {
         }
         sendTgNotify(tgMsg);
 
-        // 返回 status 给前端判断
         res.json({ success: true, orderId, usdtAmount: finalUSDT.toFixed(4), cnyAmount, wallet, status: orderStatus });
 
-    } catch(e) { console.error(e); res.json({success:false, msg: e.message}); }
+    } catch(e) { 
+        await client.query('ROLLBACK'); // 发生任何错误，回滚所有操作（钱退回，订单不生成）
+        console.error(e); 
+        res.json({success:false, msg: e.message}); 
+    } finally {
+        client.release(); // 释放连接
+    }
 });
 
 // 7. 获取订单
@@ -860,12 +926,39 @@ app.post('/api/withdraw', upload.single('file'), async (req, res) => {
 
 // 11. 聊天
 app.post('/api/chat/send', async (req, res) => {
-    const { sessionId, text } = req.body;
+    // 增加 msgType 参数，默认为 'text'
+    const { sessionId, text, msgType } = req.body; 
+    const type = msgType || 'text';
+    
     try {
-        await pool.query('INSERT INTO chats (session_id, sender, content) VALUES ($1, $2, $3)', [sessionId, 'user', text]);
-        sendTgNotify(`💬 <b>客服消息</b>\n来自: ${sessionId}\n内容: ${text}`);
+        // 存入数据库
+        const result = await pool.query(
+            'INSERT INTO chats (session_id, sender, content, msg_type) VALUES ($1, $2, $3, $4) RETURNING created_at', 
+            [sessionId, 'user', text, type]
+        );
+        
+        const created_at = result.rows[0].created_at;
+
+        // 1. 发送 TG 通知 (如果是图片，提示是图片)
+        const tgContent = type === 'image' ? '[发送了一张图片]' : text;
+        sendTgNotify(`💬 <b>客服消息</b>\n来自: ${sessionId}\n内容: ${tgContent}`);
+
+        // 2. Socket 广播给管理员 (管理员在监听 'admin_room' 或者具体 session)
+        // 这里为了简单，我们让前端监听自己的 session_id，后台监听特定事件，或者直接推给所有人
+        // 实际上，管理员前端也应该监听这个 session_id 的房间
+        io.emit('new_message', { 
+            session_id: sessionId, 
+            sender: 'user', 
+            content: text, 
+            msg_type: type,
+            created_at: created_at
+        });
+
         res.json({ success: true });
-    } catch(e) { res.json({success:false}); }
+    } catch(e) { 
+        console.error(e);
+        res.json({success:false}); 
+    }
 });
 
 app.get('/api/chat/history/:sid', async (req, res) => {
@@ -941,11 +1034,42 @@ app.post('/api/admin/chat/read', adminAuth, async (req, res) => {
     await pool.query("UPDATE chats SET is_read = TRUE WHERE session_id = $1 AND sender = 'user'", [sessionId]);
     res.json({success:true});
 });
+app.post('/api/chat/upload', upload.single('file'), async (req, res) => {
+    if (req.file) {
+        try {
+            const url = await uploadToCloud(req.file.buffer);
+            res.json({ success: true, url: url });
+        } catch (e) {
+            res.json({ success: false, error: 'Upload failed' });
+        }
+    } else {
+        res.json({ success: false, error: 'No file' });
+    }
+});
 
 app.post('/api/admin/reply', adminAuth, async (req, res) => {
-    const { sessionId, text } = req.body;
-    await pool.query("INSERT INTO chats (session_id, sender, content) VALUES ($1, 'admin', $2)", [sessionId, text]);
-    res.json({success:true});
+    const { sessionId, text, msgType } = req.body;
+    const type = msgType || 'text';
+
+    try {
+        const result = await pool.query(
+            "INSERT INTO chats (session_id, sender, content, msg_type) VALUES ($1, 'admin', $2, $3) RETURNING created_at", 
+            [sessionId, 'admin', text, type]
+        );
+
+        // Socket 推送给该用户的房间
+        io.to(sessionId).emit('new_message', {
+            session_id: sessionId,
+            sender: 'admin',
+            content: text,
+            msg_type: type,
+            created_at: result.rows[0].created_at
+        });
+
+        res.json({success:true});
+    } catch(e) {
+        res.status(500).json({success:false, msg: e.message});
+    }
 });
 
 app.post('/api/upload', adminAuth, upload.single('file'), async (req, res) => {
@@ -1074,8 +1198,9 @@ const startServer = async () => {
         await bot.startPolling();
         console.log("✅ 机器人已上线");
 
-        console.log("⏳ 3. 正在启动 Web 服务器...");
-        app.listen(PORT, () => {
+       console.log("⏳ 3. 正在启动 Web 服务器...");
+        // [修改] 使用 server.listen 而不是 app.listen
+        server.listen(PORT, () => {
             console.log(`🚀 Server running on port ${PORT}`);
         });
 
