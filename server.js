@@ -443,7 +443,7 @@ ${cloudInfo}${cloudBar}
             bot.sendMessage(chatId, "✅ 数据库字段修复完成");
         } catch(e) { bot.sendMessage(chatId, "❌ " + e.message); }
     }
-
+});
 bot.on('callback_query', async (callbackQuery) => {
     const action = callbackQuery.data;
     const msg = callbackQuery.message;
