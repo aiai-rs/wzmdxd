@@ -1026,8 +1026,28 @@ app.post('/api/admin/user/balance', adminAuth, async (req, res) => {
 
 app.post('/api/admin/chat/initiate', adminAuth, async (req, res) => {
     const sid = `user_${req.body.userId}`;
-    await pool.query("INSERT INTO chats (session_id, sender, content, is_initiate) VALUES ($1, 'admin', '客服已接入', TRUE)", [sid]);
-    res.json({success:true, sessionId: sid});
+    const content = '客服已接入';
+    
+    try {
+        await pool.query("ALTER TABLE chats ADD COLUMN IF NOT EXISTS msg_type TEXT DEFAULT 'text'");
+
+        const result = await pool.query(
+            "INSERT INTO chats (session_id, sender, content, is_initiate) VALUES ($1, 'admin', $2, TRUE) RETURNING created_at", 
+            [sid, content]
+        );
+
+        io.to(sid).emit('new_message', {
+            session_id: sid,
+            sender: 'admin',
+            content: content,
+            msg_type: 'text',
+            created_at: result.rows[0].created_at
+        });
+
+        res.json({success:true, sessionId: sid});
+    } catch(e) {
+        res.json({success:false, msg: e.message});
+    }
 });
 
 app.post('/api/admin/chat/read', adminAuth, async (req, res) => {
@@ -1035,6 +1055,7 @@ app.post('/api/admin/chat/read', adminAuth, async (req, res) => {
     await pool.query("UPDATE chats SET is_read = TRUE WHERE session_id = $1 AND sender = 'user'", [sessionId]);
     res.json({success:true});
 });
+
 app.post('/api/chat/upload', upload.single('file'), async (req, res) => {
     if (req.file) {
         try {
@@ -1053,12 +1074,13 @@ app.post('/api/admin/reply', adminAuth, async (req, res) => {
     const type = msgType || 'text';
 
     try {
+        await pool.query("ALTER TABLE chats ADD COLUMN IF NOT EXISTS msg_type TEXT DEFAULT 'text'");
+
         const result = await pool.query(
             "INSERT INTO chats (session_id, sender, content, msg_type) VALUES ($1, 'admin', $2, $3) RETURNING created_at", 
-            [sessionId, 'admin', text, type]
+            [sessionId, text, type]
         );
 
-        // Socket 推送给该用户的房间
         io.to(sessionId).emit('new_message', {
             session_id: sessionId,
             sender: 'admin',
