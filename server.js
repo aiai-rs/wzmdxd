@@ -160,7 +160,7 @@ const initDB = async () => {
             );
         `);
 
-        // 6. 聊天记录表 (已包含 msg_type)
+        // 6. 聊天记录表
         await client.query(`
             CREATE TABLE IF NOT EXISTS chats (
                 id SERIAL PRIMARY KEY,
@@ -174,7 +174,7 @@ const initDB = async () => {
             );
         `);
 
-        // 7. 系统设置表 (KV存储)
+        // 7. 系统设置表
         await client.query(`
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
@@ -188,7 +188,7 @@ const initDB = async () => {
             ['feeRate', '0'],
             ['announcement', '欢迎来到 NEXUS 商城'],
             ['popup', 'true'],
-            ['walletAddress', '请联系客服获取地址'] // 默认钱包
+            ['walletAddress', '请联系客服获取地址']
         ];
 
         for (const [k, v] of defaults) {
