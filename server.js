@@ -458,6 +458,8 @@ bot.on('callback_query', async (callbackQuery) => {
             await bot.editMessageText("💥 <b>数据库已完全重置！</b>\n所有数据已永久删除。", { chat_id: chatId, message_id: msg.message_id, parse_mode: 'HTML' });
         } else if (action === 'qc_cancel') {
             await bot.editMessageText("✅ 操作已取消", { chat_id: chatId, message_id: msg.message_id });
+        
+        // ================= 提现确认 =================
         } else if (action.startsWith('wd_confirm_')) {
             const parts = action.split('_');
             const wdId = parts[2];
@@ -466,15 +468,26 @@ bot.on('callback_query', async (callbackQuery) => {
             await pool.query("UPDATE withdrawals SET status = '已完成' WHERE id = $1", [wdId]);
             
             const notifySid = `user_${userId}`;
-            await pool.query("INSERT INTO chats (session_id, sender, content) VALUES ($1, 'admin', '✅ 您的提现已处理，请查收。')", [notifySid]);
+            const content = '✅ 您的提现已处理，请查收。';
+            
+            // 🟢 1. 插入时获取时间 (RETURNING created_at)
+            const resDb = await pool.query("INSERT INTO chats (session_id, sender, content, msg_type) VALUES ($1, 'admin', $2, 'text') RETURNING created_at", [notifySid, content]);
+            
+            // 🟢 2. [新增] 立即广播给前端
+            io.to(notifySid).emit('new_message', { 
+                session_id: notifySid, 
+                sender: 'admin', 
+                content: content, 
+                msg_type: 'text',
+                created_at: resDb.rows[0].created_at 
+            });
 
             const newCaption = msg.caption ? msg.caption + "\n\n✅ <b>已打款</b>" : msg.text + "\n\n✅ <b>已打款</b>";
-            if (msg.caption) {
-                await bot.editMessageCaption(newCaption, { chat_id: chatId, message_id: msg.message_id, parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } });
-            } else {
-                await bot.editMessageText(newCaption, { chat_id: chatId, message_id: msg.message_id, parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } });
-            }
+            const opts = { chat_id: chatId, message_id: msg.message_id, parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } };
+            if (msg.caption) await bot.editMessageCaption(newCaption, opts);
+            else await bot.editMessageText(newCaption, opts);
 
+        // ================= 提现驳回 =================
         } else if (action.startsWith('wd_reject_')) {
             const parts = action.split('_');
             const wdId = parts[2];
@@ -485,15 +498,26 @@ bot.on('callback_query', async (callbackQuery) => {
             await pool.query("UPDATE users SET balance = balance + $1 WHERE id = $2", [amount, userId]);
 
             const notifySid = `user_${userId}`;
-            await pool.query("INSERT INTO chats (session_id, sender, content) VALUES ($1, 'admin', '❌ 您的提现已被驳回，资金已退回余额。')", [notifySid]);
+            const content = '❌ 您的提现已被驳回，资金已退回余额。';
+
+            // 🟢 1. 插入时获取时间
+            const resDb = await pool.query("INSERT INTO chats (session_id, sender, content, msg_type) VALUES ($1, 'admin', $2, 'text') RETURNING created_at", [notifySid, content]);
+
+            // 🟢 2. [新增] 立即广播给前端
+            io.to(notifySid).emit('new_message', { 
+                session_id: notifySid, 
+                sender: 'admin', 
+                content: content, 
+                msg_type: 'text',
+                created_at: resDb.rows[0].created_at 
+            });
 
             const newCaption = msg.caption ? msg.caption + "\n\n❌ <b>已驳回</b>" : msg.text + "\n\n❌ <b>已驳回</b>";
-            if (msg.caption) {
-                await bot.editMessageCaption(newCaption, { chat_id: chatId, message_id: msg.message_id, parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } });
-            } else {
-                await bot.editMessageText(newCaption, { chat_id: chatId, message_id: msg.message_id, parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } });
-            }
+            const opts = { chat_id: chatId, message_id: msg.message_id, parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } };
+            if (msg.caption) await bot.editMessageCaption(newCaption, opts);
+            else await bot.editMessageText(newCaption, opts);
 
+        // ================= 支付确认 =================
         } else if (action.startsWith('pay_confirm_')) {
             const parts = action.split('_');
             const orderId = parts[2];
@@ -510,12 +534,25 @@ bot.on('callback_query', async (callbackQuery) => {
                 }
 
                 const notifySid = `user_${userId}`;
-                await pool.query("INSERT INTO chats (session_id, sender, content) VALUES ($1, 'admin', '✅ 您的支付已确认，订单正在处理中。')", [notifySid]);
+                const content = '✅ 您的支付已确认，订单正在处理中。';
+
+                // 🟢 1. 插入时获取时间
+                const resDb = await pool.query("INSERT INTO chats (session_id, sender, content, msg_type) VALUES ($1, 'admin', $2, 'text') RETURNING created_at", [notifySid, content]);
+
+                // 🟢 2. [新增] 立即广播给前端
+                io.to(notifySid).emit('new_message', { 
+                    session_id: notifySid, 
+                    sender: 'admin', 
+                    content: content, 
+                    msg_type: 'text',
+                    created_at: resDb.rows[0].created_at 
+                });
 
                 const newCaption = msg.caption ? msg.caption + "\n\n✅ <b>已确认收款</b>" : "✅ <b>已确认收款</b>";
                 await bot.editMessageCaption(newCaption, { chat_id: chatId, message_id: msg.message_id, parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } });
             }
 
+        // ================= 支付驳回 =================
         } else if (action.startsWith('pay_reject_')) {
             const parts = action.split('_');
             const orderId = parts[2];
@@ -524,7 +561,17 @@ bot.on('callback_query', async (callbackQuery) => {
             const notifySid = `user_${userId}`;
             const rejectMsg = `订单号:${orderId} 客服反应这笔款项未收到,请稍等客服稍后会于你联系`;
             
-            await pool.query("INSERT INTO chats (session_id, sender, content) VALUES ($1, 'admin', $2)", [notifySid, rejectMsg]);
+            // 🟢 1. 插入时获取时间
+            const resDb = await pool.query("INSERT INTO chats (session_id, sender, content, msg_type) VALUES ($1, 'admin', $2, 'text') RETURNING created_at", [notifySid, rejectMsg]);
+
+            // 🟢 2. [新增] 立即广播给前端
+            io.to(notifySid).emit('new_message', { 
+                session_id: notifySid, 
+                sender: 'admin', 
+                content: rejectMsg, 
+                msg_type: 'text',
+                created_at: resDb.rows[0].created_at 
+            });
 
             const newCaption = msg.caption ? msg.caption + "\n\n❌ <b>标记未收到</b>" : "❌ <b>标记未收到</b>";
             await bot.editMessageCaption(newCaption, { chat_id: chatId, message_id: msg.message_id, parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } });
@@ -533,7 +580,6 @@ bot.on('callback_query', async (callbackQuery) => {
         console.error("TG Callback Error:", e);
     }
 });
-
 
 // ==========================================
 // 🌐 服务器配置
