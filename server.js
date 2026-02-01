@@ -19,7 +19,6 @@ const { v4: uuidv4 } = require('uuid');
 
 const app = express();
 app.set('trust proxy', 1);
-app.set('trust proxy', 1);
 const server = http.createServer(app); // 将 app 包装进 http server
 // 初始化 Socket.io，允许跨域
 const io = new Server(server, {
@@ -889,7 +888,7 @@ app.get('/api/order', async (req, res) => {
     } catch(e) { res.json([]); }
 });
 
-app.post(app.post('/api/order/cancel', async (req, res) => {
+app.post('/api/order/cancel', async (req, res) => {
     const { orderId, userId } = req.body;
     try {
         const orderRes = await pool.query('SELECT * FROM orders WHERE order_id = $1 AND user_id = $2', [orderId, userId]);
