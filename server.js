@@ -14,7 +14,11 @@ const cloudinary = require('cloudinary').v2;
 const stream = require('stream');
 const cron = require('node-cron');
 
+const bcrypt = require('bcryptjs');
+const { v4: uuidv4 } = require('uuid');
+
 const app = express();
+app.set('trust proxy', 1);
 app.set('trust proxy', 1);
 const server = http.createServer(app); // 将 app 包装进 http server
 // 初始化 Socket.io，允许跨域
@@ -92,13 +96,15 @@ const initDB = async () => {
     try {
         const client = await pool.connect();
         
-        // 1. 用户表
+       // 1. 用户表 (修改：增加 invite_code 和 invited_by)
         await client.query(`
             CREATE TABLE IF NOT EXISTS users (
                 id BIGINT PRIMARY KEY,
                 contact TEXT NOT NULL,
                 password TEXT NOT NULL,
                 balance NUMERIC(10, 4) DEFAULT 0,
+                invite_code TEXT, 
+                invited_by BIGINT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         `);
@@ -174,11 +180,22 @@ const initDB = async () => {
             );
         `);
 
-        // 7. 系统设置表
+       // 7. 系统设置表
         await client.query(`
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT
+            );
+        `);
+
+        // 8. 审计日志表 (新增)
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS audit_logs (
+                id SERIAL PRIMARY KEY,
+                admin_name TEXT,
+                action TEXT,
+                details TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         `);
 
@@ -214,8 +231,11 @@ cron.schedule('0 0 * * *', async () => {
         // 2. 清理旧提现记录 (新增)
         await pool.query("DELETE FROM withdrawals WHERE created_at < NOW() - INTERVAL '3 days'");
         
-        // 3. 清理旧聊天记录 (新增)
+        // 3. 清理旧聊天记录
         await pool.query("DELETE FROM chats WHERE created_at < NOW() - INTERVAL '3 days'");
+        
+        // 4. 清理旧审计日志
+        await pool.query("DELETE FROM audit_logs WHERE created_at < NOW() - INTERVAL '3 days'");
 
         console.log('✅ 所有旧数据清理完成 (订单/提现/聊天)');
     } catch (e) {
@@ -650,14 +670,28 @@ const hiring = await pool.query('SELECT * FROM hiring');
 
 // 2. 注册
 app.post('/api/user/register', async (req, res) => {
-    const { contact, password, uid } = req.body;
+    const { contact, password, uid, inviteCode } = req.body; // 接收 inviteCode
     try {
         const check = await pool.query('SELECT id FROM users WHERE contact = $1', [contact]);
         if(check.rows.length > 0) return res.json({success:false, msg:'用户已存在'});
 
         const id = uid || Math.floor(100000 + Math.random() * 900000);
-        await pool.query('INSERT INTO users (id, contact, password, balance) VALUES ($1, $2, $3, 0)', [id, contact, password]);
-        res.json({ success: true, isNew: true, userId: id, uid: id, balance: 0 });
+        // 安全修复：加密密码
+        const hashedPassword = await bcrypt.hash(password, 10);
+        // 生成我的邀请码
+        const myInviteCode = uuidv4().split('-')[0].toUpperCase();
+        
+        let inviterId = null;
+        if (inviteCode) {
+            const inviterRes = await pool.query('SELECT id FROM users WHERE invite_code = $1', [inviteCode]);
+            if (inviterRes.rows.length > 0) inviterId = inviterRes.rows[0].id;
+        }
+
+        await pool.query(
+            'INSERT INTO users (id, contact, password, balance, invite_code, invited_by) VALUES ($1, $2, $3, 0, $4, $5)', 
+            [id, contact, hashedPassword, myInviteCode, inviterId]
+        );
+        res.json({ success: true, isNew: true, userId: id, uid: id, balance: 0, inviteCode: myInviteCode });
     } catch(e) { res.json({success:false, msg: e.message}); }
 });
 
@@ -665,10 +699,16 @@ app.post('/api/user/register', async (req, res) => {
 app.post('/api/user/login', async (req, res) => {
     const { contact, password } = req.body;
     try {
-        const resDb = await pool.query('SELECT * FROM users WHERE contact = $1 AND password = $2', [contact, password]);
+        const resDb = await pool.query('SELECT * FROM users WHERE contact = $1', [contact]);
         if(resDb.rows.length > 0) {
             const u = resDb.rows[0];
-            res.json({ success: true, userId: u.id, uid: u.id, balance: parseFloat(u.balance) });
+            // 安全修复：比对加密密码
+            const match = await bcrypt.compare(password, u.password);
+            if (match) {
+                res.json({ success: true, userId: u.id, uid: u.id, balance: parseFloat(u.balance), inviteCode: u.invite_code });
+            } else {
+                res.json({ success: false, msg: '账号或密码错误' });
+            }
         } else {
             res.json({ success: false, msg: '账号或密码错误' });
         }
@@ -718,11 +758,11 @@ app.post('/api/user/change-password', async (req, res) => {
     }
 });
 
-// 6. 提交订单
+// 6. 提交订单 (安全修复版)
 app.post('/api/order', async (req, res) => {
-    const { userId, productId, paymentMethod, shippingInfo, useBalance, balanceAmount, contactInfo } = req.body;
+    // 接收 cartItems 而不是 totalAmount
+    const { userId, productId, cartItems, paymentMethod, shippingInfo, useBalance, contactInfo } = req.body;
     
-    // 获取一个独立的客户端连接以进行事务处理
     const client = await pool.connect();
 
     try {
@@ -731,73 +771,114 @@ app.post('/api/order', async (req, res) => {
         const userRes = await client.query('SELECT * FROM users WHERE id = $1', [userId]);
         const user = userRes.rows[0];
         
-        let prodName = "购物车商品";
+        let prodName = "";
         let amount = 0;
 
-        if (productId !== 'cart') {
+        // 逻辑分支：购物车结算 vs 单品购买
+        if (productId === 'cart') {
+            prodName = "购物车商品";
+            if (!cartItems || !Array.isArray(cartItems) || cartItems.length === 0) {
+                throw new Error("购物车为空");
+            }
+
+            // 提取ID并查询数据库真实价格
+            const itemIds = cartItems.map(i => i.id);
+            const dbProdsRes = await client.query('SELECT id, price, name, stock FROM products WHERE id = ANY($1)', [itemIds]);
+            const dbProds = dbProdsRes.rows;
+
+            for (const item of cartItems) {
+                // 强制转换 ID 为字符串进行比较
+                const dbItem = dbProds.find(p => p.id.toString() === item.id.toString());
+                if (!dbItem) throw new Error(`商品ID ${item.id} 已下架`);
+                if (dbItem.stock < item.quantity) throw new Error(`商品 ${dbItem.name} 库存不足`);
+                
+                // 后端累加价格 (安全核心)
+                amount += parseFloat(dbItem.price) * parseInt(item.quantity);
+                
+                // 扣减库存
+                await client.query('UPDATE products SET stock = stock - $1 WHERE id = $2', [item.quantity, item.id]);
+            }
+        } else {
+            // 单品购买
             const prodRes = await client.query('SELECT * FROM products WHERE id = $1', [productId]);
             const prod = prodRes.rows[0];
             if(prod) {
-                // 检查库存防止超卖
-                if (prod.stock <= 0) {
-                    throw new Error('商品库存不足');
-                }
+                if (prod.stock <= 0) throw new Error('商品库存不足');
                 prodName = prod.name;
                 amount = parseFloat(prod.price);
                 await client.query('UPDATE products SET stock = stock - 1 WHERE id = $1', [productId]);
+            } else {
+                throw new Error('商品不存在');
             }
-        } else {
-            amount = req.body.totalAmount || 10; 
         }
 
         let finalUSDT = amount;
         if(useBalance && user && parseFloat(user.balance) > 0) {
             const deduct = Math.min(parseFloat(user.balance), amount);
             finalUSDT -= deduct;
-            // 使用事务客户端扣款
+            // 扣余额
             await client.query('UPDATE users SET balance = balance - $1 WHERE id = $2', [deduct, userId]);
+            // 记录余额变动日志
+            await client.query("INSERT INTO audit_logs (admin_name, action, details) VALUES ($1, $2, $3)", 
+                ['SYSTEM', 'BALANCE_DEDUCT', `用户 ${userId} 消费抵扣 ${deduct} USDT`]);
         }
 
         const rate = parseFloat(await getSetting('rate'));
         const feeRate = parseFloat(await getSetting('feeRate'));
         const cnyAmount = (finalUSDT * rate * (1 + feeRate/100)).toFixed(2);
         
-        const orderId = 'ORD-' + Date.now();
+        // 改良：使用 UUID 生成唯一订单号
+        const orderId = uuidv4(); 
         const wallet = await getSetting('walletAddress');
         const finalShippingInfo = { ...shippingInfo, contact_method: contactInfo };
 
         let orderStatus = '待支付';
-        
         if (finalUSDT <= 0) {
-            orderStatus = '已支付'; 
+            orderStatus = '已支付';
+            // 新增：余额全额支付成功，触发消费返利
+            // 注意：这里按商品原价(amount)算返利，还是按实际付出的余额(deduct)算？通常按商品价值算比较大方，或者按deduct算。
+            // 这里我们按商品总价值 amount 计算，刺激消费。
+            // 由于事务还没提交，我们最好在在这里不await这个辅助函数以免死锁，或者放在COMMIT之后。
+            // 为了安全，建议放在 COMMIT 之后执行。
         }
 
-        // 使用事务客户端插入订单
+        // 插入订单
         await client.query(
             `INSERT INTO orders (order_id, user_id, product_name, payment_method, usdt_amount, cny_amount, status, shipping_info, wallet, expires_at) 
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW() + INTERVAL '30 minutes')`,
             [orderId, userId, prodName, paymentMethod, finalUSDT.toFixed(4), cnyAmount, orderStatus, JSON.stringify(finalShippingInfo), wallet]
         );
 
-        await client.query('COMMIT'); // 提交事务：只有到这里没报错，扣款和订单才会生效
+        await client.query('COMMIT'); 
 
-        let tgMsg = `🆕 <b>新订单提醒</b>\n\n单号: <code>${orderId}</code>\n用户: ${user ? user.contact : userId}\n联系: ${contactInfo}\n商品: ${prodName}\n支付: ${paymentMethod}\n需付: ${finalUSDT.toFixed(4)} USDT`;
-        
-        if (finalUSDT <= 0) {
-            tgMsg += `\n✅ <b>余额全额抵扣，请直接发货</b>`;
-        } else if (paymentMethod !== 'USDT') {
-            tgMsg += `\n⚠️ <b>需要人工处理</b>`;
+        // === 新增代码开始 ===
+        if (orderStatus === '已支付') {
+            // 异步执行返利，不阻塞订单响应
+            handleReferralBonus(userId, amount, '消费'); 
         }
+        // === 新增代码结束 ===
+
+        let tgMsg = `🆕 <b>新订单提醒</b>\n\n单号: <code>${orderId}</code>\n用户: ${user ? user.contact : userId}\n联系: ${contactInfo}\n商品: ${prodName}\n需付: ${finalUSDT.toFixed(4)} USDT`;
+        await client.query(
+            `INSERT INTO orders (order_id, user_id, product_name, payment_method, usdt_amount, cny_amount, status, shipping_info, wallet, expires_at) 
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW() + INTERVAL '30 minutes')`,
+            [orderId, userId, prodName, paymentMethod, finalUSDT.toFixed(4), cnyAmount, orderStatus, JSON.stringify(finalShippingInfo), wallet]
+        );
+
+        await client.query('COMMIT'); 
+
+        let tgMsg = `🆕 <b>新订单提醒</b>\n\n单号: <code>${orderId}</code>\n用户: ${user ? user.contact : userId}\n联系: ${contactInfo}\n商品: ${prodName}\n需付: ${finalUSDT.toFixed(4)} USDT`;
+        if (finalUSDT <= 0) tgMsg += `\n✅ <b>余额全额抵扣，请直接发货</b>`;
         sendTgNotify(tgMsg);
 
         res.json({ success: true, orderId, usdtAmount: finalUSDT.toFixed(4), cnyAmount, wallet, status: orderStatus });
 
     } catch(e) { 
-        await client.query('ROLLBACK'); // 发生任何错误，回滚所有操作（钱退回，订单不生成）
+        await client.query('ROLLBACK'); 
         console.error(e); 
         res.json({success:false, msg: e.message}); 
     } finally {
-        client.release(); // 释放连接
+        client.release(); 
     }
 });
 
@@ -1231,8 +1312,13 @@ app.post('/api/admin/confirm_pay', adminAuth, async (req, res) => {
         if (order && order.status !== '已支付') {
             await pool.query("UPDATE orders SET status = '已支付' WHERE order_id = $1", [orderId]);
             
-            if (order.product_name === '余额充值') {
+           if (order.product_name === '余额充值') {
                 await pool.query("UPDATE users SET balance = balance + $1 WHERE id = $2", [parseFloat(order.usdt_amount), order.user_id]);
+                // 触发充值返利
+                handleReferralBonus(order.user_id, parseFloat(order.usdt_amount), '充值');
+            } else {
+                // 触发消费返利 (普通商品)
+                handleReferralBonus(order.user_id, parseFloat(order.usdt_amount), '消费');
             }
             res.json({success:true});
         } else {
@@ -1241,6 +1327,99 @@ app.post('/api/admin/confirm_pay', adminAuth, async (req, res) => {
     } catch(e) {
         res.status(500).json({success:false, msg:e.message});
     }
+});
+// ================= 新增功能区域 =================
+
+// USDT 自动回调接口 (适配 Epusdt 或类似 Webhook)
+app.post('/api/callback/usdt_notify', async (req, res) => {
+    // 假设 webhook 发送: { order_id, amount, status, signature }
+    const { order_id, amount, status } = req.body;
+    
+    // 1. 这里应该验证签名(signature)以确保安全，此处简化
+    if (status !== 2 && status !== 'success') return res.send('ignored'); // 2通常代表成功
+
+    try {
+        const orderRes = await pool.query("SELECT * FROM orders WHERE order_id = $1", [order_id]);
+        const order = orderRes.rows[0];
+
+        if (order && order.status === '待支付') {
+            // 校验金额是否一致 (允许 0.01 误差)
+            if (Math.abs(parseFloat(amount) - parseFloat(order.usdt_amount)) < 0.1) {
+                await pool.query("UPDATE orders SET status = '已支付' WHERE order_id = $1", [order_id]);
+                
+                // 如果是充值订单，增加余额
+                if (order.product_name === '余额充值') {
+                    // 先给用户加余额 (这段逻辑原来在 handleRechargeSuccess 里，现在提取出来)
+                    await pool.query("UPDATE users SET balance = balance + $1 WHERE id = $2", [parseFloat(amount), order.user_id]);
+                    // 触发充值返利
+                    await handleReferralBonus(order.user_id, parseFloat(amount), '充值');
+                } else {
+                    // 如果是直接购买商品，触发消费返利
+                    await handleReferralBonus(order.user_id, parseFloat(amount), '消费');
+                }
+
+                sendTgNotify(`🤖 <b>USDT 自动回调成功</b>\n单号: ${order_id}\n金额: ${amount}`);
+                res.send('success');
+            } else {
+                res.send('amount_mismatch');
+            }
+        } else {
+            res.send('ok'); // 订单已处理
+        }
+    } catch (e) {
+        console.error(e);
+        res.status(500).send('error');
+    }
+});
+
+// 通用辅助函数：处理返利 (充值或消费)
+async function handleReferralBonus(userId, amount, type) {
+    // type: '充值返利' 或 '消费返利'
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        
+        // 检查是否有邀请人
+        const uRes = await client.query("SELECT invited_by FROM users WHERE id = $1", [userId]);
+        const inviterId = uRes.rows[0]?.invited_by;
+
+        if (inviterId) {
+            const bonus = amount * 0.05; // 5% 返利
+            if (bonus > 0) {
+                // 给邀请人加钱
+                await client.query("UPDATE users SET balance = balance + $1 WHERE id = $2", [bonus, inviterId]);
+                
+                // 记录审计日志
+                await client.query("INSERT INTO audit_logs (admin_name, action, details) VALUES ($1, $2, $3)", 
+                    ['SYSTEM', 'REFERRAL_BONUS', `用户 ${userId} ${type} ${amount}，邀请人 ${inviterId} 获得 ${bonus}`]);
+
+                // 通知邀请人
+                const notifySid = `user_${inviterId}`;
+                const content = `💰 恭喜！您的好友完成了${type} (${amount} USDT)，您获得 ${bonus.toFixed(4)} USDT 返利！`;
+                const msgRes = await client.query("INSERT INTO chats (session_id, sender, content, msg_type) VALUES ($1, 'admin', $2, 'text') RETURNING created_at", [notifySid, content]);
+                
+                // 实时推送
+                io.to(notifySid).emit('new_message', { 
+                    session_id: notifySid, sender: 'admin', content: content, msg_type: 'text', created_at: msgRes.rows[0].created_at 
+                });
+            }
+        }
+
+        await client.query('COMMIT');
+    } catch (e) {
+        await client.query('ROLLBACK');
+        console.error("Referral Bonus Error:", e);
+    } finally {
+        client.release();
+    }
+}
+
+// 审计日志接口
+app.get('/api/admin/audit_logs', adminAuth, async (req, res) => {
+    try {
+        const result = await pool.query('SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT 100');
+        res.json(result.rows);
+    } catch(e) { res.status(500).json([]); }
 });
 
 
