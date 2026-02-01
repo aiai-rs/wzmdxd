@@ -1436,7 +1436,7 @@ const startServer = async () => {
         // [修改] 使用 server.listen 而不是 app.listen
         server.listen(PORT, () => {
             console.log(`🚀 Server running on port ${PORT}`);
-        });
+        }); // <--- 注意这里：必须有 }); 这三个符号
 
     } catch (error) {
         console.error("❌ 启动失败，请检查数据库连接:", error);
