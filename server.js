@@ -683,7 +683,9 @@ app.post('/api/user/register', async (req, res) => {
         
         let inviterId = null;
         if (inviteCode) {
-            const inviterRes = await pool.query('SELECT id FROM users WHERE invite_code = $1', [inviteCode]);
+            // [修改点]：强制转为大写，并去除空格
+            const upperInviteCode = inviteCode.toUpperCase().trim(); 
+            const inviterRes = await pool.query('SELECT id FROM users WHERE invite_code = $1', [upperInviteCode]);
             if (inviterRes.rows.length > 0) inviterId = inviterRes.rows[0].id;
         }
 
@@ -887,7 +889,7 @@ app.get('/api/order', async (req, res) => {
     } catch(e) { res.json([]); }
 });
 
-app.post('/api/order/cancel', async (req, res) => {
+app.post(app.post('/api/order/cancel', async (req, res) => {
     const { orderId, userId } = req.body;
     try {
         const orderRes = await pool.query('SELECT * FROM orders WHERE order_id = $1 AND user_id = $2', [orderId, userId]);
@@ -896,7 +898,8 @@ app.post('/api/order/cancel', async (req, res) => {
         if (!order) return res.json({ success: false, msg: '订单不存在' });
         if (order.status !== '待支付') return res.json({ success: false, msg: '无法取消该订单' });
 
-        await pool.query("UPDATE orders SET status = '已取消' WHERE order_id = $1", [orderId]);
+        // [修改] 用户自己取消，状态设为“已关闭”，避免前端显示红色警告
+        await pool.query("UPDATE orders SET status = '已关闭' WHERE order_id = $1", [orderId]);
 
         if (order.product_name !== '余额充值' && order.product_name !== '购物车商品') {
             await pool.query("UPDATE products SET stock = stock + 1 WHERE name = $1", [order.product_name]);
