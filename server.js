@@ -678,8 +678,8 @@ app.post('/api/user/register', async (req, res) => {
         const id = uid || Math.floor(100000 + Math.random() * 900000);
         // 安全修复：加密密码
         const hashedPassword = await bcrypt.hash(password, 10);
-        // 生成我的邀请码
-        const myInviteCode = uuidv4().split('-')[0].toUpperCase();
+        // 生成我的邀请码 (修改为4位随机码)
+        const myInviteCode = Math.random().toString(36).substring(2, 6).toUpperCase();
         
         let inviterId = null;
         if (inviteCode) {
