@@ -859,22 +859,13 @@ app.post('/api/order', async (req, res) => {
         // === 新增代码结束 ===
 
         let tgMsg = `🆕 <b>新订单提醒</b>\n\n单号: <code>${orderId}</code>\n用户: ${user ? user.contact : userId}\n联系: ${contactInfo}\n商品: ${prodName}\n需付: ${finalUSDT.toFixed(4)} USDT`;
-        await client.query(
-            `INSERT INTO orders (order_id, user_id, product_name, payment_method, usdt_amount, cny_amount, status, shipping_info, wallet, expires_at) 
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW() + INTERVAL '30 minutes')`,
-            [orderId, userId, prodName, paymentMethod, finalUSDT.toFixed(4), cnyAmount, orderStatus, JSON.stringify(finalShippingInfo), wallet]
-        );
-
-        await client.query('COMMIT'); 
-
-        let tgMsg = `🆕 <b>新订单提醒</b>\n\n单号: <code>${orderId}</code>\n用户: ${user ? user.contact : userId}\n联系: ${contactInfo}\n商品: ${prodName}\n需付: ${finalUSDT.toFixed(4)} USDT`;
         if (finalUSDT <= 0) tgMsg += `\n✅ <b>余额全额抵扣，请直接发货</b>`;
         sendTgNotify(tgMsg);
 
         res.json({ success: true, orderId, usdtAmount: finalUSDT.toFixed(4), cnyAmount, wallet, status: orderStatus });
 
     } catch(e) { 
-        await client.query('ROLLBACK'); 
+        await client.query('ROLLBACK');
         console.error(e); 
         res.json({success:false, msg: e.message}); 
     } finally {
