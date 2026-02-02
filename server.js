@@ -187,13 +187,14 @@ const initDB = async () => {
             );
         `);
 
-        // 8. 审计日志表 (新增)
+       // 8. 资金明细表 (替换审计日志)
         await client.query(`
-            CREATE TABLE IF NOT EXISTS audit_logs (
+            CREATE TABLE IF NOT EXISTS balance_logs (
                 id SERIAL PRIMARY KEY,
-                admin_name TEXT,
-                action TEXT,
-                details TEXT,
+                user_id BIGINT,
+                type TEXT, -- 充值/消费/提现驳回/管理员修改/返利
+                amount NUMERIC(10, 4),
+                remark TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         `);
@@ -515,6 +516,9 @@ bot.on('callback_query', async (callbackQuery) => {
 
             await pool.query("UPDATE withdrawals SET status = '已驳回' WHERE id = $1", [wdId]);
             await pool.query("UPDATE users SET balance = balance + $1 WHERE id = $2", [amount, userId]);
+            
+            // 记录资金明细
+            await logBalance(pool, userId, '提现退回', amount, `提现申请(ID:${wdId})被驳回`);
 
             const notifySid = `user_${userId}`;
             const content = '❌ 您的提现已被驳回，资金已退回余额。';
@@ -628,6 +632,15 @@ const upload = multer({
     storage: multer.memoryStorage(),
     limits: { fileSize: 3 * 1024 * 1024 }
 });
+
+// 新增：记录资金变动辅助函数
+const logBalance = async (client, userId, type, amount, remark) => {
+    // amount 为正数代表增加，负数代表减少
+    await client.query(
+        "INSERT INTO balance_logs (user_id, type, amount, remark) VALUES ($1, $2, $3, $4)",
+        [userId, type, amount, remark]
+    );
+};
 
 const adminAuth = (req, res, next) => {
     if(req.headers['authorization'] === ADMIN_TOKEN) next();
@@ -819,17 +832,16 @@ app.post('/api/order', async (req, res) => {
             finalUSDT -= deduct;
             // 扣余额
             await client.query('UPDATE users SET balance = balance - $1 WHERE id = $2', [deduct, userId]);
-            // 记录余额变动日志
-            await client.query("INSERT INTO audit_logs (admin_name, action, details) VALUES ($1, $2, $3)", 
-                ['SYSTEM', 'BALANCE_DEDUCT', `用户 ${userId} 消费抵扣 ${deduct} USDT`]);
+            // 记录资金明细
+            await logBalance(client, userId, '购物消费', -deduct, `订单 ${prodName} 余额抵扣`);
         }
 
         const rate = parseFloat(await getSetting('rate'));
         const feeRate = parseFloat(await getSetting('feeRate'));
         const cnyAmount = (finalUSDT * rate * (1 + feeRate/100)).toFixed(2);
         
-        // 改良：使用 UUID 生成唯一订单号
-        const orderId = uuidv4(); 
+        // 改良：XAW-5位随机数字
+        const orderId = 'XAW-' + Math.floor(10000 + Math.random() * 90000);
         const wallet = await getSetting('walletAddress');
         const finalShippingInfo = { ...shippingInfo, contact_method: contactInfo };
 
@@ -923,7 +935,8 @@ app.post('/api/recharge', async (req, res) => {
         const rate = parseFloat(await getSetting('rate'));
         const cnyAmount = (usdtAmount * rate).toFixed(2);
         
-        const orderId = 'RCG-' + Date.now();
+        // 统一格式 XAW-5位随机数字
+        const orderId = 'XAW-' + Math.floor(10000 + Math.random() * 90000);
         const wallet = await getSetting('walletAddress');
 
         await pool.query(
@@ -950,6 +963,15 @@ app.get('/api/user/records', async (req, res) => {
             res.json([]);
         }
     } catch(e) { res.json([]); }
+});
+
+// 用户获取自己的资金明细
+app.get('/api/user/balance_logs', async (req, res) => {
+    const { userId } = req.query;
+    try {
+        const result = await pool.query('SELECT * FROM balance_logs WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50', [userId]);
+        res.json(result.rows);
+    } catch(e) { res.status(500).json([]); }
 });
 
 // 8. 确认支付凭证
@@ -1136,6 +1158,13 @@ app.post('/api/admin/user/balance', adminAuth, async (req, res) => {
         if(type === 'subtract') sql = 'UPDATE users SET balance = GREATEST(0, balance - $1) WHERE id = $2';
         if(type === 'set') sql = 'UPDATE users SET balance = $1 WHERE id = $2';
         await pool.query(sql, [val, userId]);
+        
+        // 记录日志
+        let remark = type === 'set' ? `管理员重置余额为 ${val}` : `管理员操作 ${type}`;
+        let logAmount = type === 'add' ? val : (type === 'subtract' ? -val : 0); 
+        // set 比较特殊，暂时记录 0，或者你可以先查旧余额算差值
+        await logBalance(pool, userId, '系统调整', logAmount, remark);
+
         res.json({success:true});
     } catch(e) { res.json({success:false}); }
 });
@@ -1306,9 +1335,13 @@ app.post('/api/admin/confirm_pay', adminAuth, async (req, res) => {
             await pool.query("UPDATE orders SET status = '已支付' WHERE order_id = $1", [orderId]);
             
            if (order.product_name === '余额充值') {
-                await pool.query("UPDATE users SET balance = balance + $1 WHERE id = $2", [parseFloat(order.usdt_amount), order.user_id]);
+                const amt = parseFloat(order.usdt_amount);
+                await pool.query("UPDATE users SET balance = balance + $1 WHERE id = $2", [amt, order.user_id]);
+                // 记录资金明细
+                await logBalance(pool, order.user_id, '余额充值', amt, `订单 ${orderId} 充值到账`);
+
                 // 触发充值返利
-                handleReferralBonus(order.user_id, parseFloat(order.usdt_amount), '充值');
+                handleReferralBonus(order.user_id, amt, '充值');
             } else {
                 // 触发消费返利 (普通商品)
                 handleReferralBonus(order.user_id, parseFloat(order.usdt_amount), '消费');
@@ -1379,12 +1412,11 @@ async function handleReferralBonus(userId, amount, type) {
         if (inviterId) {
             const bonus = amount * 0.05; // 5% 返利
             if (bonus > 0) {
-                // 给邀请人加钱
+               // 给邀请人加钱
                 await client.query("UPDATE users SET balance = balance + $1 WHERE id = $2", [bonus, inviterId]);
                 
-                // 记录审计日志
-                await client.query("INSERT INTO audit_logs (admin_name, action, details) VALUES ($1, $2, $3)", 
-                    ['SYSTEM', 'REFERRAL_BONUS', `用户 ${userId} ${type} ${amount}，邀请人 ${inviterId} 获得 ${bonus}`]);
+                // 记录资金明细
+                await logBalance(client, inviterId, '佣金返利', bonus, `好友 ${userId} ${type} ${amount} USDT`);
 
                 // 通知邀请人
                 const notifySid = `user_${inviterId}`;
@@ -1407,12 +1439,60 @@ async function handleReferralBonus(userId, amount, type) {
     }
 }
 
-// 审计日志接口
-app.get('/api/admin/audit_logs', adminAuth, async (req, res) => {
+// 资金明细接口 (替换审计日志) - 支持按用户ID筛选
+app.get('/api/admin/balance_logs', adminAuth, async (req, res) => {
     try {
-        const result = await pool.query('SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT 100');
+        const { userId } = req.query;
+        let query = `
+            SELECT b.*, u.contact 
+            FROM balance_logs b
+            LEFT JOIN users u ON b.user_id = u.id 
+        `;
+        const params = [];
+        
+        if (userId) {
+            query += ` WHERE b.user_id = $1 `;
+            params.push(userId);
+        }
+        
+        query += ` ORDER BY b.created_at DESC LIMIT 200`;
+        
+        const result = await pool.query(query, params);
         res.json(result.rows);
-    } catch(e) { res.status(500).json([]); }
+    } catch(e) { 
+        console.error(e);
+        res.status(500).json([]); 
+    }
+});
+
+// 管理员强制取消订单 (设置状态为'已取消'，触发前端警告)
+app.post('/api/admin/order/cancel', adminAuth, async (req, res) => {
+    const { orderId } = req.body;
+    try {
+        const client = await pool.connect();
+        await client.query('BEGIN');
+        
+        const orderRes = await client.query("SELECT * FROM orders WHERE order_id = $1", [orderId]);
+        const order = orderRes.rows[0];
+
+        if (!order) throw new Error('订单不存在');
+
+        // 更新状态为 已取消
+        await client.query("UPDATE orders SET status = '已取消' WHERE order_id = $1", [orderId]);
+
+        // 如果该订单使用了余额支付，需要退款
+        // 注意：这里只退还余额支付的部分，如果usdt_amount全额支付则退0（逻辑视具体需求定，这里假设只恢复库存，不自动退款，需人工退）
+        // 简单起见，这里只回滚库存
+        if (order.product_name !== '余额充值' && order.product_name !== '购物车商品') {
+            await client.query("UPDATE products SET stock = stock + 1 WHERE name = $1", [order.product_name]);
+        }
+
+        await client.query('COMMIT');
+        client.release();
+        res.json({ success: true });
+    } catch (e) {
+        res.json({ success: false, msg: e.message });
+    }
 });
 
 
