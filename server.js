@@ -223,24 +223,25 @@ const initDB = async () => {
 };
 
 
-// 🕒 定时任务：每天凌晨0点清理3天前的旧数据
+// 🕒 定时任务：每天凌晨0点清理3天前的“非核心”数据
 cron.schedule('0 0 * * *', async () => {
     try {
         console.log('🔄 开始每日数据清理...');
         
-        // 1. 清理旧订单
+        // 1. 清理旧订单 (3天前) - 对应前端"订单"
         await pool.query("DELETE FROM orders WHERE created_at < NOW() - INTERVAL '3 days'");
         
-        // 2. 清理旧提现记录 (新增)
+        // 2. 清理旧提现记录 (3天前) - 对应前端"提现记录"
         await pool.query("DELETE FROM withdrawals WHERE created_at < NOW() - INTERVAL '3 days'");
         
-        // 3. 清理旧聊天记录
+        // 3. 清理旧聊天记录 (3天前) - 对应客服聊天
         await pool.query("DELETE FROM chats WHERE created_at < NOW() - INTERVAL '3 days'");
         
-        // 4. 清理旧审计日志
-        await pool.query("DELETE FROM audit_logs WHERE created_at < NOW() - INTERVAL '3 days'");
+        // 4. 清理旧资金明细 (3天前) - 对应前端"资金明细"
+        // 注意：这只会删除流水记录，不会影响用户的当前余额(balance)
+        await pool.query("DELETE FROM balance_logs WHERE created_at < NOW() - INTERVAL '7 days'");
 
-        console.log('✅ 所有旧数据清理完成 (订单/提现/聊天)');
+        console.log('✅ 清理完成：已删除3天前的 [订单/提现/聊天/流水]');
     } catch (e) {
         console.error('❌ 清理失败:', e);
     }
@@ -807,6 +808,9 @@ app.post('/api/order', async (req, res) => {
             const dbProds = dbProdsRes.rows;
 
             for (const item of cartItems) {
+                // [安全修复] 校验购买数量必须为正整数
+                if (parseInt(item.quantity) <= 0) throw new Error(`商品数量必须大于0`);
+
                 // 强制转换 ID 为字符串进行比较
                 const dbItem = dbProds.find(p => p.id.toString() === item.id.toString());
                 if (!dbItem) throw new Error(`商品ID ${item.id} 已下架`);
@@ -826,7 +830,8 @@ app.post('/api/order', async (req, res) => {
                 if (prod.stock <= 0) throw new Error('商品库存不足');
                 prodName = prod.name;
                 amount = parseFloat(prod.price);
-                await client.query('UPDATE products SET stock = stock - 1 WHERE id = $1', [productId]);
+                // [安全修复] 确保库存不会被扣减为负数 (虽然上面检查了，但为了数据库安全建议加个保险)
+                await client.query('UPDATE products SET stock = GREATEST(0, stock - 1) WHERE id = $1', [productId]);
             } else {
                 throw new Error('商品不存在');
             }
@@ -1026,6 +1031,12 @@ app.post('/api/withdraw', upload.single('file'), async (req, res) => {
     try {
         const userId = req.body.userId;
         const amount = parseFloat(req.body.amount);
+        
+        // [安全修复] 必须校验金额为正数
+        if (isNaN(amount) || amount <= 0) {
+            return res.json({ success: false, msg: '金额必须大于0' });
+        }
+
         const method = req.body.method;
         const addressText = req.body.address || '无账号信息';
 
