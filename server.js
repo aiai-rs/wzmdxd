@@ -192,12 +192,15 @@ const initDB = async () => {
             CREATE TABLE IF NOT EXISTS balance_logs (
                 id SERIAL PRIMARY KEY,
                 user_id BIGINT,
-                type TEXT, -- 充值/消费/提现驳回/管理员修改/返利
+                type TEXT, 
                 amount NUMERIC(10, 4),
                 remark TEXT,
+                balance_after NUMERIC(10, 4), 
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         `);
+        // 自动修复旧表结构（防止报错）
+        try { await client.query("ALTER TABLE balance_logs ADD COLUMN IF NOT EXISTS balance_after NUMERIC(10, 4)"); } catch(e){}
 
         // 初始化默认设置
         const defaults = [
@@ -633,12 +636,15 @@ const upload = multer({
     limits: { fileSize: 3 * 1024 * 1024 }
 });
 
-// 新增：记录资金变动辅助函数
+// 新增：记录资金变动辅助函数 (修改版：记录余额快照)
 const logBalance = async (client, userId, type, amount, remark) => {
-    // amount 为正数代表增加，负数代表减少
+    // 先查询当前最新余额
+    const res = await client.query("SELECT balance FROM users WHERE id = $1", [userId]);
+    const currentBal = res.rows[0] ? res.rows[0].balance : 0;
+    
     await client.query(
-        "INSERT INTO balance_logs (user_id, type, amount, remark) VALUES ($1, $2, $3, $4)",
-        [userId, type, amount, remark]
+        "INSERT INTO balance_logs (user_id, type, amount, remark, balance_after) VALUES ($1, $2, $3, $4, $5)",
+        [userId, type, amount, remark, currentBal]
     );
 };
 
@@ -1029,6 +1035,9 @@ app.post('/api/withdraw', upload.single('file'), async (req, res) => {
         if (user.balance < amount) return res.json({ success: false, msg: '余额不足' });
 
         await pool.query('UPDATE users SET balance = balance - $1 WHERE id = $2', [amount, userId]);
+        
+        // [新增] 记录提现明细 (负数)
+        await logBalance(pool, userId, '提现申请', -amount, `申请提现到 ${method}`);
 
         let logAddress = addressText;
         if (req.file)
@@ -1160,10 +1169,11 @@ app.post('/api/admin/user/balance', adminAuth, async (req, res) => {
         await pool.query(sql, [val, userId]);
         
         // 记录日志
-        let remark = type === 'set' ? `管理员重置余额为 ${val}` : `管理员操作 ${type}`;
+        let remark = type === 'set' ? `客服重置余额为 ${val}` : `客服后台操作 ${type}`;
         let logAmount = type === 'add' ? val : (type === 'subtract' ? -val : 0); 
-        // set 比较特殊，暂时记录 0，或者你可以先查旧余额算差值
-        await logBalance(pool, userId, '系统调整', logAmount, remark);
+        
+        // 将类型显示为 '客服后台充值'
+        await logBalance(pool, userId, '客服后台充值', logAmount, remark);
 
         res.json({success:true});
     } catch(e) { res.json({success:false}); }
