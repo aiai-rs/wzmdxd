@@ -689,7 +689,7 @@ const hiring = await pool.query('SELECT * FROM hiring');
 
 // 2. 注册
 app.post('/api/user/register', async (req, res) => {
-    const { contact, password, uid, inviteCode } = req.body; // 接收 inviteCode
+    const { contact, password, uid, inviteCode, source } = req.body; // 【修改】接收 source
     try {
         const check = await pool.query('SELECT id FROM users WHERE contact = $1', [contact]);
         if(check.rows.length > 0) return res.json({success:false, msg:'用户已存在'});
@@ -709,8 +709,8 @@ app.post('/api/user/register', async (req, res) => {
         }
 
         await pool.query(
-            'INSERT INTO users (id, contact, password, balance, invite_code, invited_by) VALUES ($1, $2, $3, 0, $4, $5)', 
-            [id, contact, hashedPassword, myInviteCode, inviterId]
+            'INSERT INTO users (id, contact, password, balance, invite_code, invited_by, source) VALUES ($1, $2, $3, 0, $4, $5, $6)', 
+            [id, contact, hashedPassword, myInviteCode, inviterId, source || 'xaw888.com'] // 【修改】写入来源
         );
         res.json({ success: true, isNew: true, userId: id, uid: id, balance: 0, inviteCode: myInviteCode });
     } catch(e) { res.json({success:false, msg: e.message}); }
@@ -782,7 +782,8 @@ app.post('/api/user/change-password', async (req, res) => {
 // 6. 提交订单 (安全修复版)
 app.post('/api/order', async (req, res) => {
     // 接收 cartItems 而不是 totalAmount
-    const { userId, productId, cartItems, paymentMethod, shippingInfo, useBalance, contactInfo } = req.body;
+    // 【修改】下方增加了 source
+    const { userId, productId, cartItems, paymentMethod, shippingInfo, useBalance, contactInfo, source } = req.body;
     
     const client = await pool.connect();
 
@@ -867,13 +868,14 @@ app.post('/api/order', async (req, res) => {
         }
 
         // 插入订单
+        // 【修改】增加了 source 字段
         await client.query(
-            `INSERT INTO orders (order_id, user_id, product_name, payment_method, usdt_amount, cny_amount, status, shipping_info, wallet, expires_at) 
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW() + INTERVAL '30 minutes')`,
-            [orderId, userId, prodName, paymentMethod, finalUSDT.toFixed(4), cnyAmount, orderStatus, JSON.stringify(finalShippingInfo), wallet]
+            `INSERT INTO orders (order_id, user_id, product_name, payment_method, usdt_amount, cny_amount, status, shipping_info, wallet, source, expires_at) 
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW() + INTERVAL '30 minutes')`,
+            [orderId, userId, prodName, paymentMethod, finalUSDT.toFixed(4), cnyAmount, orderStatus, JSON.stringify(finalShippingInfo), wallet, source || 'xaw888.com']
         );
 
-        await client.query('COMMIT'); 
+        await client.query('COMMIT');
 
         // === 新增代码开始 ===
         if (orderStatus === '已支付') {
@@ -1086,14 +1088,16 @@ app.post('/api/withdraw', upload.single('file'), async (req, res) => {
 // 11. 聊天
 app.post('/api/chat/send', async (req, res) => {
     // 增加 msgType 参数，默认为 'text'
-    const { sessionId, text, msgType } = req.body; 
+    // 【修改】接收 source
+    const { sessionId, text, msgType, source } = req.body; 
     const type = msgType || 'text';
     
     try {
         // 存入数据库
+        // 【修改】写入 source
         const result = await pool.query(
-            'INSERT INTO chats (session_id, sender, content, msg_type) VALUES ($1, $2, $3, $4) RETURNING created_at', 
-            [sessionId, 'user', text, type]
+            'INSERT INTO chats (session_id, sender, content, msg_type, source) VALUES ($1, $2, $3, $4, $5) RETURNING created_at', 
+            [sessionId, 'user', text, type, source || 'xaw888.com']
         );
         
         const created_at = result.rows[0].created_at;
