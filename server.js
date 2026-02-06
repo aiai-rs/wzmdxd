@@ -1502,38 +1502,66 @@ app.post('/api/admin/update/hiring', adminAuth, async (req, res) => {
 });
 app.post('/api/admin/confirm_pay', adminAuth, async (req, res) => {
     const { orderId } = req.body;
+    const client = await pool.connect(); // 使用事务防止出错
+
     try {
-        const orderRes = await pool.query("SELECT * FROM orders WHERE order_id = $1", [orderId]);
+        await client.query('BEGIN');
+
+        // 1. 锁定订单行，防止并发问题
+        const orderRes = await client.query("SELECT * FROM orders WHERE order_id = $1 FOR UPDATE", [orderId]);
         const order = orderRes.rows[0];
         
-        if (order && order.status !== '已支付') {
-            await pool.query("UPDATE orders SET status = '已支付' WHERE order_id = $1", [orderId]);
+        if (!order) {
+            await client.query('ROLLBACK');
+            return res.json({success:false, msg:'订单不存在'});
+        }
+
+        // 2. 只有当状态不是'已支付'时才处理，防止重复加钱
+        if (order.status !== '已支付') {
+            // 更新状态
+            await client.query("UPDATE orders SET status = '已支付' WHERE order_id = $1", [orderId]);
             
-           if (order.product_name === '余额充值') {
+            // [核心修复] 只要商品名包含 '充值' 就认为是充值订单 (兼容性更好)
+            if (order.product_name && order.product_name.includes('充值')) {
                 const amt = parseFloat(order.usdt_amount);
-                await pool.query("UPDATE users SET balance = balance + $1 WHERE id = $2", [amt, order.user_id]);
-                // 记录资金明细
-                await logBalance(pool, order.user_id, '余额充值', amt, `订单 ${orderId} 充值到账`);
+                
+                // 给用户加钱
+                await client.query("UPDATE users SET balance = balance + $1 WHERE id = $2", [amt, order.user_id]);
+                
+                // 记录资金流水 (确保这里引用的 logBalance 函数是支持 client 参数的，如果不支持请看下面)
+                // 为了保险，这里直接手写插入日志，不依赖外部函数，防止报错
+                const balRes = await client.query("SELECT balance FROM users WHERE id = $1", [order.user_id]);
+                const currentBal = balRes.rows[0] ? balRes.rows[0].balance : 0;
+                
+                await client.query(
+                    "INSERT INTO balance_logs (user_id, type, amount, remark, balance_after) VALUES ($1, $2, $3, $4, $5)",
+                    [order.user_id, '余额充值', amt, `订单 ${orderId} 充值到账`, currentBal]
+                );
 
-                // 触发充值返利
+                // 处理返利
                 handleReferralBonus(order.user_id, amt, '充值');
-           } else {
-                // 触发消费返利 (普通商品)
+            } else {
+                // 普通商品消费返利
                 handleReferralBonus(order.user_id, parseFloat(order.usdt_amount), '消费');
-          }
+            }
             
-            // [新增] 通知用户订单状态已更新
-            io.to(`user_${order.user_id}`).emit('order_update');
+            await client.query('COMMIT');
 
-            // [新增] 通知其他可能开启的后台页面刷新
+            // 通知前端刷新
+            io.to(`user_${order.user_id}`).emit('order_update');
             notifyAdminUpdate();
 
             res.json({success:true});
         } else {
-            res.json({success:false, msg:'订单不存在或已支付'});
+            await client.query('ROLLBACK');
+            res.json({success:false, msg:'订单状态已经是已支付，请勿重复操作'});
         }
     } catch(e) {
+        await client.query('ROLLBACK');
+        console.error("确认支付出错:", e);
         res.status(500).json({success:false, msg:e.message});
+    } finally {
+        client.release();
     }
 });
 // ================= 新增功能区域 =================
