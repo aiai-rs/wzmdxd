@@ -555,7 +555,7 @@ bot.on('callback_query', async (callbackQuery) => {
             const notifySid = `user_${userId}`;
             const content = '✅ 您的提现已处理，请查收。';
             
-            // 🟢 1. 插入时获取时间 (RETURNING created_at)
+           // 🟢 1. 插入时获取时间 (RETURNING created_at)
             const resDb = await pool.query("INSERT INTO chats (session_id, sender, content, msg_type) VALUES ($1, 'admin', $2, 'text') RETURNING created_at", [notifySid, content]);
             
             // 🟢 2. [新增] 立即广播给前端
@@ -566,6 +566,9 @@ bot.on('callback_query', async (callbackQuery) => {
                 msg_type: 'text',
                 created_at: resDb.rows[0].created_at 
             });
+
+            // 【新增】告诉前端刷新提现列表状态（变更为已完成）
+            io.to(notifySid).emit('order_update');
 
             const newCaption = msg.caption ? msg.caption + "\n\n✅ <b>已打款</b>" : msg.text + "\n\n✅ <b>已打款</b>";
             const opts = { chat_id: chatId, message_id: msg.message_id, parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } };
@@ -585,7 +588,7 @@ bot.on('callback_query', async (callbackQuery) => {
             // 记录资金明细
             await logBalance(pool, userId, '提现退回', amount, `提现申请(ID:${wdId})被驳回`);
 
-            const notifySid = `user_${userId}`;
+           const notifySid = `user_${userId}`;
             const content = '❌ 您的提现已被驳回，资金已退回余额。';
 
             // 🟢 1. 插入时获取时间
@@ -596,9 +599,12 @@ bot.on('callback_query', async (callbackQuery) => {
                 session_id: notifySid, 
                 sender: 'admin', 
                 content: content, 
-                msg_type: 'text',
+                msg_type: 'text', 
                 created_at: resDb.rows[0].created_at 
             });
+
+            // 【新增】告诉前端刷新余额 (因为钱退回来了)
+            io.to(notifySid).emit('order_update');
 
             const newCaption = msg.caption ? msg.caption + "\n\n❌ <b>已驳回</b>" : msg.text + "\n\n❌ <b>已驳回</b>";
             const opts = { chat_id: chatId, message_id: msg.message_id, parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } };
@@ -621,7 +627,7 @@ bot.on('callback_query', async (callbackQuery) => {
                     await pool.query("UPDATE users SET balance = balance + $1 WHERE id = $2", [parseFloat(order.usdt_amount), userId]);
                 }
 
-                const notifySid = `user_${userId}`;
+               const notifySid = `user_${userId}`;
                 const content = '✅ 您的支付已确认，订单正在处理中。';
 
                 // 🟢 1. 插入时获取时间
@@ -632,9 +638,12 @@ bot.on('callback_query', async (callbackQuery) => {
                     session_id: notifySid, 
                     sender: 'admin', 
                     content: content, 
-                    msg_type: 'text',
+                    msg_type: 'text', 
                     created_at: resDb.rows[0].created_at 
                 });
+
+                // 【新增】告诉前端刷新余额和订单状态
+                io.to(notifySid).emit('order_update');
 
                 const newCaption = msg.caption ? msg.caption + "\n\n✅ <b>已确认收款</b>" : "✅ <b>已确认收款</b>";
                 await bot.editMessageCaption(newCaption, { chat_id: chatId, message_id: msg.message_id, parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } });
@@ -1027,6 +1036,9 @@ app.post('/api/order/cancel', async (req, res) => {
             await pool.query("UPDATE products SET stock = stock + 1 WHERE name = $1", [order.product_name]);
         }
 
+        // [新增] 用户取消订单后，通知后台管理员刷新界面
+        notifyAdminUpdate();
+
         const paidBalance = parseFloat(order.usdt_amount) - parseFloat(order.cny_amount / 7.0); 
 
         res.json({ success: true });
@@ -1116,7 +1128,9 @@ app.post('/api/order/confirm-payment', upload.single('file'), async (req, res) =
 
         // [修改] 确保状态更新为待审核，proof 字段只存标记，不存文件
         await pool.query("UPDATE orders SET proof = 'TG_SENT', status = '待审核' WHERE order_id = $1", [orderId]);
-        res.json({success:true});
+        
+		notifyAdminUpdate();
+		res.json({success:true});
     } catch(e) { 
         console.error(e);
         // 即使TG发送偶尔失败，也返回成功让用户放心，后台可联系
@@ -1290,10 +1304,13 @@ app.post('/api/admin/user/balance', adminAuth, async (req, res) => {
         
         // 记录日志
         let remark = type === 'set' ? `客服重置余额为 ${val}` : `客服后台操作 ${type}`;
-        let logAmount = type === 'add' ? val : (type === 'subtract' ? -val : 0); 
+let logAmount = type === 'add' ? val : (type === 'subtract' ? -val : 0); 
         
         // 将类型显示为 '客服后台充值'
         await logBalance(pool, userId, '客服后台充值', logAmount, remark);
+
+        // 【新增】实时通知前端刷新余额
+        io.to(`user_${userId}`).emit('order_update');
 
         res.json({success:true});
     } catch(e) { res.json({success:false}); }
@@ -1381,12 +1398,23 @@ app.post('/api/upload', adminAuth, upload.single('file'), async (req, res) => {
     }
 });
 
-app.post('/api/admin/order/ship', adminAuth, (req, res) => {
+app.post('/api/admin/order/ship', adminAuth, async (req, res) => {
     const { orderId, trackingNumber } = req.body;
-    // 这里简单处理，实际应更新数据库状态
-    pool.query("UPDATE orders SET tracking_number = $1, status = '已发货' WHERE order_id = $2", [trackingNumber, orderId]);
-    sendTgNotify(`🚚 <b>订单已发货</b>\n单号: <code>${orderId}</code>\n物流: ${trackingNumber}`);
-    res.json({success:true});
+    try {
+        // [修改] 更新状态并返回 user_id，以便通知
+        const result = await pool.query("UPDATE orders SET tracking_number = $1, status = '已发货' WHERE order_id = $2 RETURNING user_id", [trackingNumber, orderId]);
+        
+        // [新增] 实时通知该用户刷新订单状态
+        if(result.rows.length > 0) {
+            io.to(`user_${result.rows[0].user_id}`).emit('order_update');
+        }
+
+        sendTgNotify(`🚚 <b>订单已发货</b>\n单号: <code>${orderId}</code>\n物流: ${trackingNumber}`);
+        res.json({success:true});
+    } catch(e) {
+        console.error(e);
+        res.status(500).json({success:false, msg:e.message});
+    }
 });
 
 app.post('/api/admin/order/upload_qrcode', adminAuth, upload.single('qrcode'), async (req, res) => {
@@ -1591,15 +1619,18 @@ app.post('/api/callback/usdt_notify', async (req, res) => {
                     await handleReferralBonus(order.user_id, parseFloat(amount), '充值');
                 } else {
                     // 如果是直接购买商品，触发消费返利
-                    await handleReferralBonus(order.user_id, parseFloat(amount), '消费');
-                }
-
-                sendTgNotify(`🤖 <b>USDT 自动回调成功</b>\n单号: ${order_id}\n金额: ${amount}`);
-                res.send('success');
-            } else {
-                res.send('amount_mismatch');
+                await handleReferralBonus(order.user_id, parseFloat(amount), '消费');
             }
+
+            // 【新增】关键：通知前端刷新余额和订单状态
+            io.to(`user_${order.user_id}`).emit('order_update');
+
+            sendTgNotify(`🤖 <b>USDT 自动回调成功</b>\n单号: ${order_id}\n金额: ${amount}`);
+            res.send('success');
         } else {
+            res.send('amount_mismatch');
+        }
+    } else {
             res.send('ok'); // 订单已处理
         }
     } catch (e) {
@@ -1698,6 +1729,10 @@ app.post('/api/admin/order/cancel', adminAuth, async (req, res) => {
         }
 
         await client.query('COMMIT');
+        
+        // 【新增】告诉前端刷新订单状态（变更为已取消）
+        io.to(`user_${order.user_id}`).emit('order_update');
+
         client.release();
         res.json({ success: true });
     } catch (e) {
