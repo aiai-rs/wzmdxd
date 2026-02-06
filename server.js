@@ -80,11 +80,15 @@ io.on('connection', (socket) => {
         console.log(`Socket ${socket.id} 加入房间: ${room}`);
     });
 
-    socket.on('disconnect', () => {
+ socket.on('disconnect', () => {
         console.log('用户断开连接:', socket.id);
     });
 });
 
+// [新增] 定义广播函数，通知所有后台管理员刷新数据
+const notifyAdminUpdate = () => {
+    io.emit('admin_update', { timestamp: Date.now() });
+};
 
 const pool = new Pool({
     connectionString: DATABASE_URL,
@@ -186,6 +190,14 @@ const initDB = async () => {
                 value TEXT
             );
         `);
+		
+		// [新增] 8. 分类排序表
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS categories (
+                name TEXT PRIMARY KEY,
+                priority INT DEFAULT 0
+            );
+        `);
 
        // 8. 资金明细表 (替换审计日志)
         await client.query(`
@@ -229,6 +241,17 @@ const broadcastGlobalUpdate = async () => {
         const rate = await getSetting('rate');
         const feeRate = await getSetting('feeRate');
         const announcement = await getSetting('announcement');
+        
+        // [修改] 获取分类并按照数据库中的优先级排序
+        const distinctCats = [...new Set(prods.rows.map(p => p.category))];
+        const prioritiesRes = await pool.query('SELECT name, priority FROM categories');
+        const pMap = {};
+        prioritiesRes.rows.forEach(r => pMap[r.name] = r.priority);
+        
+        // 排序：优先级数字越大越靠前，如果没设置则默认为0
+        const categories = distinctCats.sort((a, b) => (pMap[b] || 0) - (pMap[a] || 0));
+
+        io.emit('global_update', {
         const categories = [...new Set(prods.rows.map(p => p.category))];
         
         io.emit('global_update', {
@@ -343,7 +366,7 @@ bot.on('message', async (msg) => {
         bot.sendMessage(chatId, helpMsg, { parse_mode: 'HTML' });
     }
 
-   // /ck 查看数据
+ // /ck 查看数据
     else if (text === '/ck') {
         try {
             // --- 1. 基础业务数据 ---
@@ -351,45 +374,42 @@ bot.on('message', async (msg) => {
             const o = (await pool.query('SELECT COUNT(*) FROM orders')).rows[0].count;
             const p = (await pool.query('SELECT COUNT(*) FROM products')).rows[0].count;
             
-            // --- 2. 数据库容量 (Supabase) ---
+            // --- 2. 数据库存储空间 (Neon Free: 500MB) ---
             // 查询实际占用字节数
             const dbSizeQuery = await pool.query("SELECT pg_database_size(current_database()) as size");
             const dbSizeBytes = parseInt(dbSizeQuery.rows[0].size);
             const dbUsedMB = (dbSizeBytes / 1024 / 1024).toFixed(2);
-            const dbTotalMB = 500; // ⚠️ Supabase 免费层通常为 500MB，付费版可按需调整此数字
+            const dbTotalMB = 500; // ⚠️ Neon 免费版存储限制为 500MB
             const dbFreeMB = (dbTotalMB - dbUsedMB).toFixed(2);
             const dbPercent = Math.min(100, (dbUsedMB / dbTotalMB) * 100).toFixed(1);
 
             // --- 3. 服务器内存 (Render Paid) ---
             const mem = process.memoryUsage();
             const ramUsedMB = (mem.rss / 1024 / 1024).toFixed(2);
-            const ramTotalMB = 512; // ⚠️ Render Starter 付费版通常是 512MB，如果是 Standard 版请改为 2048
+            const ramTotalMB = 512; // Render Starter 内存限制
             const ramFreeMB = (ramTotalMB - ramUsedMB).toFixed(2);
             const ramPercent = Math.min(100, (ramUsedMB / ramTotalMB) * 100).toFixed(1);
 
-            // --- 4. Cloudinary 积分 (调用官方 API) ---
+            // --- 4. Cloudinary 积分 (图片流量) ---
             let cloudInfo = "📡 获取失败";
             let cloudBar = "";
             try {
-                // 获取配额使用情况
                 const cloudRes = await cloudinary.api.usage();
                 if (cloudRes && cloudRes.credits) {
                     const cUsed = cloudRes.credits.usage.toFixed(2);
-                    const cLimit = cloudRes.credits.limit; // 免费版通常是 25
+                    const cLimit = cloudRes.credits.limit; 
                     const cPercent = cloudRes.credits.used_percent.toFixed(1);
                     const cLeft = (cLimit - cUsed).toFixed(2);
                     
-                    // 生成进度条
                     const filled = Math.round(cPercent / 10);
                     const empty = 10 - filled;
                     const bar = '■'.repeat(filled) + '□'.repeat(empty);
 
-                    cloudInfo = `总量: ${cLimit} | 剩余: ${cLeft}\n已用: ${cUsed} (${cPercent}%)`;
+                    cloudInfo = `额度: ${cLimit} | 剩余: ${cLeft}\n已用: ${cUsed} (${cPercent}%)`;
                     cloudBar = `\n${bar}`;
                 }
             } catch (err) {
-                console.error("Cloudinary API Error:", err.message);
-                cloudInfo = "⚠️ API 权限不足或网络超时";
+                cloudInfo = "⚠️ Cloudinary API 未配置或报错";
             }
 
             // --- 5. 进度条绘制函数 ---
@@ -411,9 +431,8 @@ bot.on('message', async (msg) => {
             const f = await getSetting('feeRate');
             const w = await getSetting('walletAddress');
 
-
             const stats = `
-<b>📊 NEXUS 资源监控面板</b>
+<b>📊  资源监控面板 (Neon版)</b>
 ━━━━━━━━━━━━━━━━━━
 <b>⏱️ 运行状态</b>
 Running: <code>${runTimeStr}</code>
@@ -423,12 +442,13 @@ Running: <code>${runTimeStr}</code>
 已用: ${ramUsedMB} MB (${ramPercent}%)
 ${drawBar(ramPercent)}
 
-<b>🗄️ 数据库空间 (Supabase)</b>
+<b>🗄️ 数据库存储 (Neon)</b>
 总量: ${dbTotalMB} MB | 剩余: ${dbFreeMB} MB
 已用: ${dbUsedMB} MB (${dbPercent}%)
 ${drawBar(dbPercent)}
+<i>(注: Neon免费版限制500MB存储，流量通常不限)</i>
 
-<b>☁️ 图片/视频积分 (Cloudinary)</b>
+<b>☁️ 图片托管 (Cloudinary)</b>
 ${cloudInfo}${cloudBar}
 
 <b>📈 业务数据统计</b>
@@ -704,9 +724,14 @@ const hiring = await pool.query('SELECT * FROM hiring');
         const popup = await getSetting('popup');
         const wallet = await getSetting('walletAddress');
 
-        const categories = [...new Set(prods.rows.map(p => p.category))];
+        // [修改] 获取分类并按照数据库中的优先级排序
+        const distinctCats = [...new Set(prods.rows.map(p => p.category))];
+        const prioritiesRes = await pool.query('SELECT name, priority FROM categories');
+        const pMap = {};
+        prioritiesRes.rows.forEach(r => pMap[r.name] = r.priority);
+        const categories = distinctCats.sort((a, b) => (pMap[b] || 0) - (pMap[a] || 0));
 
-res.json({
+        res.json({
             products: prods.rows,
             categories,
             hiring: hiring.rows,
@@ -765,10 +790,14 @@ app.post('/api/user/register', async (req, res) => {
             if (inviterRes.rows.length > 0) inviterId = inviterRes.rows[0].id;
         }
 
-        await pool.query(
+       await pool.query(
             'INSERT INTO users (id, contact, password, balance, invite_code, invited_by, source) VALUES ($1, $2, $3, 0, $4, $5, $6)', 
             [id, contact, hashedPassword, myInviteCode, inviterId, source || 'xaw888.com'] // 【修改】写入来源
         );
+        
+        // [新增] 通知后台有新用户
+        notifyAdminUpdate();
+
         res.json({ success: true, isNew: true, userId: id, uid: id, balance: 0, inviteCode: myInviteCode });
     } catch(e) { res.json({success:false, msg: e.message}); }
 });
@@ -945,9 +974,12 @@ app.post('/api/order', async (req, res) => {
         if (finalUSDT <= 0) tgMsg += `\n✅ <b>余额全额抵扣，请直接发货</b>`;
         sendTgNotify(tgMsg);
 
+        // [新增] 通知后台有新订单
+        notifyAdminUpdate();
+
         res.json({ success: true, orderId, usdtAmount: finalUSDT.toFixed(4), cnyAmount, wallet, status: orderStatus });
 
-    } catch(e) { 
+    } catch(e) {
         await client.query('ROLLBACK');
         console.error(e); 
         res.json({success:false, msg: e.message}); 
@@ -1012,10 +1044,14 @@ app.post('/api/recharge', async (req, res) => {
         await pool.query(
             `INSERT INTO orders (order_id, user_id, product_name, payment_method, usdt_amount, cny_amount, wallet, expires_at) 
              VALUES ($1, $2, '余额充值', $3, $4, $5, $6, NOW() + INTERVAL '30 minutes')`,
-            [orderId, userId, method, usdtAmount.toFixed(4), cnyAmount, wallet]
+       [orderId, userId, method, usdtAmount.toFixed(4), cnyAmount, wallet]
         );
 
         sendTgNotify(`💰 <b>新充值订单</b>\n单号: <code>${orderId}</code>\n用户: ${user.contact}\n金额: ${usdtAmount} USDT`);
+        
+        // [新增] 通知后台有充值
+        notifyAdminUpdate();
+
         res.json({ success: true, orderId, usdtAmount: usdtAmount.toFixed(4), cnyAmount, wallet });
     } catch(e) { res.json({success:false, msg: e.message}); }
 });
@@ -1129,12 +1165,15 @@ app.post('/api/withdraw', upload.single('file'), async (req, res) => {
             }
         };
 
-       if (req.file) {
+     if (req.file) {
             await bot.sendPhoto(TG_ADMIN_GROUP_ID, req.file.buffer, options);
         } else {
             await bot.sendMessage(TG_ADMIN_GROUP_ID, options.caption, options);
         }
         
+        // [新增] 通知后台有提现申请
+        notifyAdminUpdate();
+
         res.json({ success: true });
     } catch (e) {
         console.error(e);
@@ -1344,21 +1383,29 @@ app.post('/api/admin/order/ship', adminAuth, (req, res) => {
 app.post('/api/admin/order/upload_qrcode', adminAuth, upload.single('qrcode'), async (req, res) => {
     const { orderId } = req.body;
     if(req.file) {
-        const b64 = Buffer.from(req.file.buffer).toString('base64');
-        const dataURI = `data:${req.file.mimetype};base64,${b64}`;
-        
-        // 修改：增加 RETURNING user_id 以便通知用户
-        const result = await pool.query("UPDATE orders SET qrcode_url = $1, expires_at = NOW() + INTERVAL '30 minutes' WHERE order_id = $2 RETURNING user_id", [dataURI, orderId]);
-        const userId = result.rows[0]?.user_id;
+       try {
+           // [修改] 上传到 Cloudinary，获取短链接 URL
+           const url = await uploadToCloud(req.file.buffer);
+           
+           // [修改] 存入 URL
+           const result = await pool.query("UPDATE orders SET qrcode_url = $1, expires_at = NOW() + INTERVAL '30 minutes' WHERE order_id = $2 RETURNING user_id", [url, orderId]);
+           const userId = result.rows[0]?.user_id;
 
-        sendTgNotify(`✅ <b>收款码已上传</b>\n单号: <code>${orderId}</code>`);
-        
-        // 实时通知该用户刷新订单
-        if(userId) {
-            io.to(`user_${userId}`).emit('order_update');
-        }
+           sendTgNotify(`✅ <b>收款码已上传</b>\n单号: <code>${orderId}</code>`);
+           
+           // 实时通知该用户刷新订单
+           if(userId) {
+               io.to(`user_${userId}`).emit('order_update');
+           }
 
-        res.json({success:true});
+           // [新增] 通知后台刷新 (你之前漏了这个)
+           notifyAdminUpdate();
+    
+           res.json({success:true});
+       } catch (e) {
+           console.error(e);
+           res.json({success:false, msg: 'Upload failed'});
+       }
     } else res.json({success:false});
 });
 
@@ -1369,6 +1416,22 @@ app.post('/api/admin/update/announcement', adminAuth, async (req, res) => {
 app.post('/api/admin/update/popup', adminAuth, async (req, res) => {
     await setSetting('popup', req.body.open);
     res.json({success:true});
+});
+// [新增] 更新分类优先级
+app.post('/api/admin/category/priority', adminAuth, async (req, res) => {
+    const { name, priority } = req.body;
+    try {
+        // 使用 upsert 语法 (如果存在则更新，不存在则插入)
+        await pool.query(
+            'INSERT INTO categories (name, priority) VALUES ($1, $2) ON CONFLICT (name) DO UPDATE SET priority = $2',
+            [name, parseInt(priority)]
+        );
+        // 立即广播更新前端
+        await broadcastGlobalUpdate();
+        res.json({success: true});
+    } catch(e) {
+        res.status(500).json({success: false, msg: e.message});
+    }
 });
 
 // 商品增删改
@@ -1445,10 +1508,13 @@ app.post('/api/admin/confirm_pay', adminAuth, async (req, res) => {
            } else {
                 // 触发消费返利 (普通商品)
                 handleReferralBonus(order.user_id, parseFloat(order.usdt_amount), '消费');
-            }
+          }
             
             // [新增] 通知用户订单状态已更新
             io.to(`user_${order.user_id}`).emit('order_update');
+
+            // [新增] 通知其他可能开启的后台页面刷新
+            notifyAdminUpdate();
 
             res.json({success:true});
         } else {
