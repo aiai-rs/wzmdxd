@@ -217,11 +217,43 @@ const initDB = async () => {
 
         console.log("✅ 数据库表结构初始化完成");
         client.release();
-    } catch (err) {
+} catch (err) {
         console.error("❌ 数据库初始化失败:", err);
     }
 };
 
+// 广播全局数据函数
+const broadcastGlobalUpdate = async () => {
+    try {
+        const prods = await pool.query('SELECT * FROM products ORDER BY is_pinned DESC, id DESC');
+        const rate = await getSetting('rate');
+        const feeRate = await getSetting('feeRate');
+        const announcement = await getSetting('announcement');
+        const categories = [...new Set(prods.rows.map(p => p.category))];
+        
+        io.emit('global_update', {
+            products: prods.rows,
+            categories,
+            rate: parseFloat(rate),
+            feeRate: parseFloat(feeRate),
+            announcement
+        });
+    } catch(e) { console.error("Broadcast Error", e); }
+};
+
+// 🕒 定时任务：每1.5小时随机减少库存 (随机范围 1-5)
+setInterval(async () => {
+    try {
+        // 使用 SQL 的 random() 函数，让每一行商品减去的库存数都不同
+        await pool.query(`
+            UPDATE products 
+            SET stock = GREATEST(0, stock - floor(random() * 5 + 1)::int) 
+            WHERE stock > 0
+        `);
+        console.log(`📉 自动减库存: 所有商品已随机减少 1-5 个库存`);
+        broadcastGlobalUpdate(); // 广播更新
+    } catch(e) { console.error("Auto Reduce Stock Error", e); }
+}, 90 * 60 * 1000); // 90分钟 = 1.5小时
 
 // 🕒 定时任务：每天凌晨0点清理3天前的“非核心”数据
 cron.schedule('0 0 * * *', async () => {
@@ -674,7 +706,7 @@ const hiring = await pool.query('SELECT * FROM hiring');
 
         const categories = [...new Set(prods.rows.map(p => p.category))];
 
-        res.json({
+res.json({
             products: prods.rows,
             categories,
             hiring: hiring.rows,
@@ -685,6 +717,31 @@ const hiring = await pool.query('SELECT * FROM hiring');
             wallet // 将钱包地址传给前端
         });
     } catch(e) { res.status(500).json({error: e.message}); }
+});
+
+// 1.1 缺货登记
+app.post('/api/notify-restock', async (req, res) => {
+    const { contact, productName } = req.body;
+    sendTgNotify(`📢 <b>缺货补货提醒</b>\n商品: ${productName}\n客户联系: ${contact}\n请尽快补货！`);
+    res.json({success: true});
+});
+
+// 1.2 裂变可视化数据
+app.get('/api/user/team', async (req, res) => {
+    const { userId } = req.query;
+    try {
+        // 获取我邀请的人
+        const teamRes = await pool.query(`
+            SELECT id, contact, created_at, 
+            (SELECT COALESCE(SUM(amount), 0) FROM balance_logs WHERE user_id = users.id AND type = '佣金返利') as earned
+            FROM users WHERE invited_by = $1 ORDER BY created_at DESC
+        `, [userId]);
+        
+        // 计算总收益
+        const totalRes = await pool.query("SELECT COALESCE(SUM(amount), 0) as total FROM balance_logs WHERE user_id = $1 AND type = '佣金返利'", [userId]);
+        
+        res.json({ success: true, list: teamRes.rows, total: parseFloat(totalRes.rows[0].total) });
+    } catch(e) { res.json({success: false, list: [], total: 0}); }
 });
 
 // 2. 注册
@@ -1284,13 +1341,23 @@ app.post('/api/admin/order/ship', adminAuth, (req, res) => {
     res.json({success:true});
 });
 
-app.post('/api/admin/order/upload_qrcode', adminAuth, upload.single('qrcode'), (req, res) => {
+app.post('/api/admin/order/upload_qrcode', adminAuth, upload.single('qrcode'), async (req, res) => {
     const { orderId } = req.body;
     if(req.file) {
         const b64 = Buffer.from(req.file.buffer).toString('base64');
         const dataURI = `data:${req.file.mimetype};base64,${b64}`;
-        pool.query("UPDATE orders SET qrcode_url = $1, expires_at = NOW() + INTERVAL '30 minutes' WHERE order_id = $2", [dataURI, orderId]);
+        
+        // 修改：增加 RETURNING user_id 以便通知用户
+        const result = await pool.query("UPDATE orders SET qrcode_url = $1, expires_at = NOW() + INTERVAL '30 minutes' WHERE order_id = $2 RETURNING user_id", [dataURI, orderId]);
+        const userId = result.rows[0]?.user_id;
+
         sendTgNotify(`✅ <b>收款码已上传</b>\n单号: <code>${orderId}</code>`);
+        
+        // 实时通知该用户刷新订单
+        if(userId) {
+            io.to(`user_${userId}`).emit('order_update');
+        }
+
         res.json({success:true});
     } else res.json({success:false});
 });
@@ -1322,6 +1389,10 @@ app.post('/api/admin/product', adminAuth, upload.single('file'), async (req, res
             'INSERT INTO products (id, name, price, stock, category, type, description, image_url) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)',
             [Date.now(), name, price, stock, category, type, desc, imageJson]
         );
+        
+        // 立即广播更新
+        await broadcastGlobalUpdate();
+
         res.json({success:true});
     } catch (e) {
         console.error(e);
@@ -1334,10 +1405,14 @@ app.put('/api/admin/product/:id', adminAuth, async (req, res) => {
         'UPDATE products SET name=$1, price=$2, stock=$3, category=$4, type=$5, description=$6, image_url=$7 WHERE id=$8',
         [name, price, stock, category, type, desc, imageUrl, req.params.id]
     );
+    // 立即广播更新
+    await broadcastGlobalUpdate();
     res.json({success:true});
 });
 app.delete('/api/admin/product/:id', adminAuth, async (req, res) => {
     await pool.query('DELETE FROM products WHERE id = $1', [req.params.id]);
+    // 立即广播更新
+    await broadcastGlobalUpdate();
     res.json({success:true});
 });
 // 招聘更新
@@ -1367,10 +1442,14 @@ app.post('/api/admin/confirm_pay', adminAuth, async (req, res) => {
 
                 // 触发充值返利
                 handleReferralBonus(order.user_id, amt, '充值');
-            } else {
+           } else {
                 // 触发消费返利 (普通商品)
                 handleReferralBonus(order.user_id, parseFloat(order.usdt_amount), '消费');
             }
+            
+            // [新增] 通知用户订单状态已更新
+            io.to(`user_${order.user_id}`).emit('order_update');
+
             res.json({success:true});
         } else {
             res.json({success:false, msg:'订单不存在或已支付'});
