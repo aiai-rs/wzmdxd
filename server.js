@@ -242,18 +242,27 @@ const broadcastGlobalUpdate = async () => {
         const feeRate = await getSetting('feeRate');
         const announcement = await getSetting('announcement');
         
+        // [新增] 获取招聘信息和更多设置
+        const hiring = await pool.query('SELECT * FROM hiring');
+        const popup = await getSetting('popup');
+        const wallet = await getSetting('walletAddress');
+
         // [修改] 获取分类并按照数据库中的优先级排序
         const distinctCats = [...new Set(prods.rows.map(p => p.category))];
         const prioritiesRes = await pool.query('SELECT name, priority FROM categories');
         const pMap = {};
         prioritiesRes.rows.forEach(r => pMap[r.name] = r.priority);
         
-       // 排序：优先级数字越大越靠前，如果没设置则默认为0
+        // 排序：优先级数字越大越靠前，如果没设置则默认为0
         const categories = distinctCats.sort((a, b) => (pMap[b] || 0) - (pMap[a] || 0));
 
         io.emit('global_update', {
             products: prods.rows,
             categories,
+            // [新增] 推送更多数据
+            hiring: hiring.rows,
+            showPopup: popup === 'true',
+            wallet,
             rate: parseFloat(rate),
             feeRate: parseFloat(feeRate),
             announcement
@@ -479,12 +488,13 @@ ${cloudInfo}${cloudBar}
         bot.sendMessage(chatId, "⚠️ <b>高危操作：请选择清理模式</b>", { parse_mode: 'HTML', ...opts });
     }
 
-    // 设置汇率
+  // 设置汇率
     else if (text.startsWith('设置汇率 ')) {
         const val = parseFloat(text.split(' ')[1]);
         if (!isNaN(val)) {
             await setSetting('rate', val);
             bot.sendMessage(chatId, `✅ 汇率已设为: ${val}`);
+            await broadcastGlobalUpdate(); // [新增]
         }
     }
 
@@ -494,6 +504,7 @@ ${cloudInfo}${cloudBar}
         if (!isNaN(val)) {
             await setSetting('feeRate', val);
             bot.sendMessage(chatId, `✅ 手续费已设为: ${val}%`);
+            await broadcastGlobalUpdate(); // [新增]
         }
     }
 
@@ -503,6 +514,7 @@ ${cloudInfo}${cloudBar}
         if (addr && addr.length > 10) {
             await setSetting('walletAddress', addr);
             bot.sendMessage(chatId, `✅ <b>收款地址已更新</b>\n<code>${addr}</code>`, {parse_mode:'HTML'});
+            await broadcastGlobalUpdate(); // [新增]
         } else {
             bot.sendMessage(chatId, "❌ 地址格式不对");
         }
@@ -1408,10 +1420,12 @@ app.post('/api/admin/order/upload_qrcode', adminAuth, upload.single('qrcode'), a
 
 app.post('/api/admin/update/announcement', adminAuth, async (req, res) => {
     await setSetting('announcement', req.body.text);
+    await broadcastGlobalUpdate(); // [新增] 广播通知
     res.json({success:true});
 });
 app.post('/api/admin/update/popup', adminAuth, async (req, res) => {
     await setSetting('popup', req.body.open);
+    await broadcastGlobalUpdate(); // [新增] 广播通知
     res.json({success:true});
 });
 // [新增] 更新分类优先级
@@ -1483,6 +1497,7 @@ app.post('/api/admin/update/hiring', adminAuth, async (req, res) => {
     for (const job of list) {
         await pool.query('INSERT INTO hiring (title, content, contact) VALUES ($1, $2, $3)', [job.title, job.content, job.contact]);
     }
+    await broadcastGlobalUpdate(); // [新增] 广播通知
     res.json({success:true});
 });
 app.post('/api/admin/confirm_pay', adminAuth, async (req, res) => {
