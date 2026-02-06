@@ -773,10 +773,16 @@ app.post('/api/notify-restock', async (req, res) => {
 app.get('/api/user/team', async (req, res) => {
     const { userId } = req.query;
     try {
-        // 获取我邀请的人
+// 获取我邀请的人
         const teamRes = await pool.query(`
             SELECT id, contact, created_at, 
-            (SELECT COALESCE(SUM(amount), 0) FROM balance_logs WHERE user_id = users.id AND type = '佣金返利') as earned
+            (
+                SELECT COALESCE(SUM(amount), 0) 
+                FROM balance_logs 
+                WHERE user_id = $1 
+                  AND type = '佣金返利' 
+                  AND remark LIKE '好友 ' || users.id || ' %'
+            ) as earned
             FROM users WHERE invited_by = $1 ORDER BY created_at DESC
         `, [userId]);
         
