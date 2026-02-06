@@ -1664,10 +1664,13 @@ async function handleReferralBonus(userId, amount, type) {
                 const content = `💰 恭喜！您的好友完成了${type} (${amount} USDT)，您获得 ${bonus.toFixed(4)} USDT 返利！`;
                 const msgRes = await client.query("INSERT INTO chats (session_id, sender, content, msg_type) VALUES ($1, 'admin', $2, 'text') RETURNING created_at", [notifySid, content]);
                 
-                // 实时推送
+                // 实时推送消息
                 io.to(notifySid).emit('new_message', { 
                     session_id: notifySid, sender: 'admin', content: content, msg_type: 'text', created_at: msgRes.rows[0].created_at 
                 });
+
+                // [新增] 关键：通知前端刷新数据(余额、邀请列表等)，这样不需要轮询也能看到钱到账
+                io.to(notifySid).emit('order_update');
             }
         }
 
