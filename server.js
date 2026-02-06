@@ -248,12 +248,9 @@ const broadcastGlobalUpdate = async () => {
         const pMap = {};
         prioritiesRes.rows.forEach(r => pMap[r.name] = r.priority);
         
-        // 排序：优先级数字越大越靠前，如果没设置则默认为0
+       // 排序：优先级数字越大越靠前，如果没设置则默认为0
         const categories = distinctCats.sort((a, b) => (pMap[b] || 0) - (pMap[a] || 0));
 
-        io.emit('global_update', {
-        const categories = [...new Set(prods.rows.map(p => p.category))];
-        
         io.emit('global_update', {
             products: prods.rows,
             categories,
