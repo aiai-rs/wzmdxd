@@ -525,6 +525,12 @@ ${cloudInfo}${cloudBar}
         try {
             await pool.query('ALTER TABLE orders ADD COLUMN IF NOT EXISTS wallet TEXT;');
             await pool.query('ALTER TABLE chats ADD COLUMN IF NOT EXISTS msg_type TEXT;');
+            
+            // [新增] 修复缺失的 source 字段，防止报错
+            await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS source TEXT;');
+            await pool.query('ALTER TABLE orders ADD COLUMN IF NOT EXISTS source TEXT;');
+            await pool.query('ALTER TABLE chats ADD COLUMN IF NOT EXISTS source TEXT;');
+
             bot.sendMessage(chatId, "✅ 数据库字段修复完成");
         } catch(e) { bot.sendMessage(chatId, "❌ " + e.message); }
     }
@@ -1550,20 +1556,19 @@ app.post('/api/admin/confirm_pay', adminAuth, async (req, res) => {
             return res.json({success:false, msg:'订单不存在'});
         }
 
-        // 2. 只有当状态不是'已支付'时才处理，防止重复加钱
+       // 2. 只有当状态不是'已支付'时才处理，防止重复加钱
         if (order.status !== '已支付') {
             // 更新状态
             await client.query("UPDATE orders SET status = '已支付' WHERE order_id = $1", [orderId]);
             
-            // [核心修复] 只要商品名包含 '充值' 就认为是充值订单 (兼容性更好)
-            if (order.product_name && order.product_name.includes('充值')) {
+            // [修改] 只有商品名严格等于 '余额充值' 才算是充值，其他带'充值'字的商品（如话费充值）都算消费
+            if (order.product_name === '余额充值') {
                 const amt = parseFloat(order.usdt_amount);
                 
                 // 给用户加钱
                 await client.query("UPDATE users SET balance = balance + $1 WHERE id = $2", [amt, order.user_id]);
                 
-                // 记录资金流水 (确保这里引用的 logBalance 函数是支持 client 参数的，如果不支持请看下面)
-                // 为了保险，这里直接手写插入日志，不依赖外部函数，防止报错
+                // 记录资金流水
                 const balRes = await client.query("SELECT balance FROM users WHERE id = $1", [order.user_id]);
                 const currentBal = balRes.rows[0] ? balRes.rows[0].balance : 0;
                 
@@ -1572,11 +1577,13 @@ app.post('/api/admin/confirm_pay', adminAuth, async (req, res) => {
                     [order.user_id, '余额充值', amt, `订单 ${orderId} 充值到账`, currentBal]
                 );
 
-                // [修改] 关闭充值返利 (注释掉下面这行)
+                // [提示] 如果你想让【充值余额】也返利，就把下面这行的注释取消掉
                 // handleReferralBonus(order.user_id, amt, '充值');
             } else {
-                // 普通商品消费返利 (保持不变，确保购买商品有返利)
-                handleReferralBonus(order.user_id, parseFloat(order.usdt_amount), '消费');
+                // [重点] 只要不是余额充值，不管是买什么（包括话费充值卡），都算消费返利
+                // 注意：这里是按用户实际支付的 USDT 金额计算返利
+                // [优化] 加上 await 确保执行完成
+                await handleReferralBonus(order.user_id, parseFloat(order.usdt_amount), '消费');
             }
             
             await client.query('COMMIT');
