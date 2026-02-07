@@ -1572,10 +1572,10 @@ app.post('/api/admin/confirm_pay', adminAuth, async (req, res) => {
                     [order.user_id, '余额充值', amt, `订单 ${orderId} 充值到账`, currentBal]
                 );
 
-                // 处理返利
-                handleReferralBonus(order.user_id, amt, '充值');
+                // [修改] 关闭充值返利 (注释掉下面这行)
+                // handleReferralBonus(order.user_id, amt, '充值');
             } else {
-                // 普通商品消费返利
+                // 普通商品消费返利 (保持不变，确保购买商品有返利)
                 handleReferralBonus(order.user_id, parseFloat(order.usdt_amount), '消费');
             }
             
@@ -1617,16 +1617,17 @@ app.post('/api/callback/usdt_notify', async (req, res) => {
             if (Math.abs(parseFloat(amount) - parseFloat(order.usdt_amount)) < 0.1) {
                 await pool.query("UPDATE orders SET status = '已支付' WHERE order_id = $1", [order_id]);
                 
-                // 如果是充值订单，增加余额
+// 如果是充值订单，增加余额
                 if (order.product_name === '余额充值') {
                     // 先给用户加余额 (这段逻辑原来在 handleRechargeSuccess 里，现在提取出来)
                     await pool.query("UPDATE users SET balance = balance + $1 WHERE id = $2", [parseFloat(amount), order.user_id]);
-                    // 触发充值返利
-                    await handleReferralBonus(order.user_id, parseFloat(amount), '充值');
+                    
+                    // [修改] 关闭充值返利 (注释掉下面这行)
+                    // await handleReferralBonus(order.user_id, parseFloat(amount), '充值');
                 } else {
-                    // 如果是直接购买商品，触发消费返利
-                await handleReferralBonus(order.user_id, parseFloat(amount), '消费');
-            }
+                    // 如果是直接购买商品，触发消费返利 (保持不变，确保购买商品有返利)
+                    await handleReferralBonus(order.user_id, parseFloat(amount), '消费');
+                }
 
             // 【新增】关键：通知前端刷新余额和订单状态
             io.to(`user_${order.user_id}`).emit('order_update');
