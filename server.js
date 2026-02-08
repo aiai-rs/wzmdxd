@@ -617,7 +617,7 @@ bot.on('callback_query', async (callbackQuery) => {
             if (msg.caption) await bot.editMessageCaption(newCaption, opts);
             else await bot.editMessageText(newCaption, opts);
 
-        // ================= 支付确认 =================
+       // ================= 支付确认 =================
         } else if (action.startsWith('pay_confirm_')) {
             const parts = action.split('_');
             const orderId = parts[2];
@@ -630,10 +630,19 @@ bot.on('callback_query', async (callbackQuery) => {
                 await pool.query("UPDATE orders SET status = '已支付' WHERE order_id = $1", [orderId]);
                 
                 if (order.product_name === '余额充值') {
+                    // 如果是余额充值，只增加余额
                     await pool.query("UPDATE users SET balance = balance + $1 WHERE id = $2", [parseFloat(order.usdt_amount), userId]);
+                } else {
+                    // 【新增】如果是购买商品，触发消费返利
+                    // 只要不在 TG 机器人里点余额充值的单子，其他所有商品确认收款都会给上级返利
+                    try {
+                        await handleReferralBonus(userId, parseFloat(order.usdt_amount), '消费');
+                    } catch (e) {
+                        console.error("TG确认返利失败:", e);
+                    }
                 }
 
-               const notifySid = `user_${userId}`;
+                const notifySid = `user_${userId}`;
                 const content = '✅ 您的支付已确认，订单正在处理中。';
 
                 // 🟢 1. 插入时获取时间
