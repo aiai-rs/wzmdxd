@@ -1542,12 +1542,12 @@ app.post('/api/admin/update/hiring', adminAuth, async (req, res) => {
 });
 app.post('/api/admin/confirm_pay', adminAuth, async (req, res) => {
     const { orderId } = req.body;
-    const client = await pool.connect(); // 使用事务防止出错
+    const client = await pool.connect(); 
 
     try {
         await client.query('BEGIN');
 
-        // 1. 锁定订单行，防止并发问题
+        // 1. 锁定订单行
         const orderRes = await client.query("SELECT * FROM orders WHERE order_id = $1 FOR UPDATE", [orderId]);
         const order = orderRes.rows[0];
         
@@ -1556,19 +1556,24 @@ app.post('/api/admin/confirm_pay', adminAuth, async (req, res) => {
             return res.json({success:false, msg:'订单不存在'});
         }
 
-       // 2. 只有当状态不是'已支付'时才处理，防止重复加钱
+        // 2. 只有当状态不是'已支付'时才处理
         if (order.status !== '已支付') {
             // 更新状态
             await client.query("UPDATE orders SET status = '已支付' WHERE order_id = $1", [orderId]);
             
-            // [修改] 只有商品名严格等于 '余额充值' 才算是充值，其他带'充值'字的商品（如话费充值）都算消费
-            if (order.product_name === '余额充值') {
+            // 【关键修改】去除空格后，严格判断是否为 '余额充值'
+            // 只有完全等于 '余额充值' 四个字，才当作充值处理
+            // 其他所有情况（包括 '王者充值'、'话费充值' 等）全部都会进入 else 触发返利！
+            const cleanName = order.product_name ? order.product_name.trim() : '';
+
+            if (cleanName === '余额充值') {
+                // === 这是一个纯充值余额的订单 ===
                 const amt = parseFloat(order.usdt_amount);
                 
-                // 给用户加钱
+                // 给用户加余额
                 await client.query("UPDATE users SET balance = balance + $1 WHERE id = $2", [amt, order.user_id]);
                 
-                // 记录资金流水
+                // 记录流水
                 const balRes = await client.query("SELECT balance FROM users WHERE id = $1", [order.user_id]);
                 const currentBal = balRes.rows[0] ? balRes.rows[0].balance : 0;
                 
@@ -1577,13 +1582,18 @@ app.post('/api/admin/confirm_pay', adminAuth, async (req, res) => {
                     [order.user_id, '余额充值', amt, `订单 ${orderId} 充值到账`, currentBal]
                 );
 
-                // [提示] 如果你想让【充值余额】也返利，就把下面这行的注释取消掉
-                // handleReferralBonus(order.user_id, amt, '充值');
             } else {
-                // [重点] 只要不是余额充值，不管是买什么（包括话费充值卡），都算消费返利
-                // 注意：这里是按用户实际支付的 USDT 金额计算返利
-                // [优化] 加上 await 确保执行完成
-                await handleReferralBonus(order.user_id, parseFloat(order.usdt_amount), '消费');
+                // === 这就是一个购买商品的订单（不管名字里有没有“充值”二字） ===
+                // 【强制返利】只要走到这里，必须执行返利逻辑
+                console.log(`[返利触发] 订单: ${orderId}, 商品: ${cleanName}, 用户: ${order.user_id}`);
+                
+                try {
+                    // 使用 await 确保返利逻辑执行完
+                    await handleReferralBonus(order.user_id, parseFloat(order.usdt_amount), '消费');
+                } catch (bonusErr) {
+                    console.error("❌ 返利发放失败:", bonusErr);
+                    // 即使返利报错，也不要回滚订单状态，保证用户能收到货
+                }
             }
             
             await client.query('COMMIT');
