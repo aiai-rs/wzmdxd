@@ -925,7 +925,7 @@ app.post('/api/order', async (req, res) => {
 
         // 逻辑分支：购物车结算 vs 单品购买
         let orderImageUrl = ''; 
-        let orderQty = 1; // 【新增】默认为1
+        let orderQty = 1; // 默认为1
 
         if (productId === 'cart') {
             if (!cartItems || !Array.isArray(cartItems) || cartItems.length === 0) {
@@ -935,17 +935,21 @@ app.post('/api/order', async (req, res) => {
             // 【修改】核心逻辑：判断是“单种商品多件”还是“多种商品”
             if (cartItems.length === 1) {
                 // 情况A：只有一种商品（比如买了3个苹果）
-                // 名字就是 "苹果"，数量是 3
                 prodName = cartItems[0].name;
                 orderQty = cartItems[0].quantity || 1;
                 orderImageUrl = cartItems[0].image_url || '';
             } else {
                 // 情况B：多种商品混合（比如苹果x1, 香蕉x2）
-                // 名字拼接显示，数量记为 1 (个包裹)
+                // 名字拼接显示
                 prodName = cartItems.map(i => `${i.name} x${i.quantity||1}`).join(' | ');
                 if(prodName.length > 200) prodName = prodName.substring(0, 197) + '...';
-                orderQty = 1; // 混合订单算作1单
-                // 【新增】取购物车第一个商品的图片作为订单封面
+                
+                // 【🔥 重点修复在这里 🔥】
+                // 之前写的是 orderQty = 1，导致永远显示 x1
+                // 现在改成：累加购物车里所有商品的 quantity
+                orderQty = cartItems.reduce((sum, item) => sum + (parseInt(item.quantity) || 1), 0);
+                
+                // 取第一张图做封面
                 if (cartItems.length > 0) orderImageUrl = cartItems[0].image_url || '';
             }
 
@@ -963,25 +967,22 @@ app.post('/api/order', async (req, res) => {
                 if (!dbItem) throw new Error(`商品ID ${item.id} 已下架`);
                 if (dbItem.stock < item.quantity) throw new Error(`商品 ${dbItem.name} 库存不足`);
                 
-                // 后端累加价格 (安全核心)
+                // 后端累加价格
                 amount += parseFloat(dbItem.price) * parseInt(item.quantity);
                 
                 // 扣减库存
                 await client.query('UPDATE products SET stock = stock - $1 WHERE id = $2', [item.quantity, item.id]);
             }
         } else {
-            // 单品购买
+            // 单品购买逻辑保持不变
             const prodRes = await client.query('SELECT * FROM products WHERE id = $1', [productId]);
             const prod = prodRes.rows[0];
             if(prod) {
                 if (prod.stock <= 0) throw new Error('商品库存不足');
                 prodName = prod.name;
-                // 【新增】记录单品图片
                 orderImageUrl = prod.image_url || '';
                 amount = parseFloat(prod.price);
-                // 【新增】单品购买默认数量为1
                 orderQty = 1; 
-                // [安全修复] 确保库存不会被扣减为负数 (虽然上面检查了，但为了数据库安全建议加个保险)
                 await client.query('UPDATE products SET stock = GREATEST(0, stock - 1) WHERE id = $1', [productId]);
             } else {
                 throw new Error('商品不存在');
