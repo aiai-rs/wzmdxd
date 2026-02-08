@@ -924,19 +924,30 @@ app.post('/api/order', async (req, res) => {
         let amount = 0;
 
         // 逻辑分支：购物车结算 vs 单品购买
-        let orderImageUrl = ''; // 【新增】定义订单图片变量
+        let orderImageUrl = ''; 
+        let orderQty = 1; // 【新增】默认为1
 
         if (productId === 'cart') {
-            // 【修改】不再叫"购物车商品"，而是拼接具体商品名
             if (!cartItems || !Array.isArray(cartItems) || cartItems.length === 0) {
                 throw new Error("购物车为空");
             }
-            // 拼接名字，例如：商品A x1 | 商品B x2
-            prodName = cartItems.map(i => `${i.name} x${i.quantity||1}`).join(' | ');
-            if(prodName.length > 200) prodName = prodName.substring(0, 197) + '...'; // 防止太长
-            
-            // 【新增】取购物车第一个商品的图片作为订单封面
-            if (cartItems.length > 0) orderImageUrl = cartItems[0].image_url || '';
+
+            // 【修改】核心逻辑：判断是“单种商品多件”还是“多种商品”
+            if (cartItems.length === 1) {
+                // 情况A：只有一种商品（比如买了3个苹果）
+                // 名字就是 "苹果"，数量是 3
+                prodName = cartItems[0].name;
+                orderQty = cartItems[0].quantity || 1;
+                orderImageUrl = cartItems[0].image_url || '';
+            } else {
+                // 情况B：多种商品混合（比如苹果x1, 香蕉x2）
+                // 名字拼接显示，数量记为 1 (个包裹)
+                prodName = cartItems.map(i => `${i.name} x${i.quantity||1}`).join(' | ');
+                if(prodName.length > 200) prodName = prodName.substring(0, 197) + '...';
+                orderQty = 1; // 混合订单算作1单
+                // 【新增】取购物车第一个商品的图片作为订单封面
+                if (cartItems.length > 0) orderImageUrl = cartItems[0].image_url || '';
+            }
 
             // 提取ID并查询数据库真实价格
             const itemIds = cartItems.map(i => i.id);
@@ -965,8 +976,11 @@ app.post('/api/order', async (req, res) => {
             if(prod) {
                 if (prod.stock <= 0) throw new Error('商品库存不足');
                 prodName = prod.name;
-                orderImageUrl = prod.image_url || ''; // 【新增】记录单品图片
+                // 【新增】记录单品图片
+                orderImageUrl = prod.image_url || '';
                 amount = parseFloat(prod.price);
+                // 【新增】单品购买默认数量为1
+                orderQty = 1; 
                 // [安全修复] 确保库存不会被扣减为负数 (虽然上面检查了，但为了数据库安全建议加个保险)
                 await client.query('UPDATE products SET stock = GREATEST(0, stock - 1) WHERE id = $1', [productId]);
             } else {
@@ -1004,11 +1018,11 @@ app.post('/api/order', async (req, res) => {
         }
 
         // 插入订单
-        // 【修改】增加了 source 字段 和 image_url 字段
+        // 【修改】增加了 source 字段、image_url 字段 和 quantity 字段
         await client.query(
-            `INSERT INTO orders (order_id, user_id, product_name, payment_method, usdt_amount, cny_amount, status, shipping_info, wallet, source, image_url, expires_at) 
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW() + INTERVAL '30 minutes')`,
-            [orderId, userId, prodName, paymentMethod, finalUSDT.toFixed(4), cnyAmount, orderStatus, JSON.stringify(finalShippingInfo), wallet, source || 'xaw888.com', orderImageUrl]
+            `INSERT INTO orders (order_id, user_id, product_name, payment_method, usdt_amount, cny_amount, status, shipping_info, wallet, source, image_url, quantity, expires_at) 
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW() + INTERVAL '30 minutes')`,
+            [orderId, userId, prodName, paymentMethod, finalUSDT.toFixed(4), cnyAmount, orderStatus, JSON.stringify(finalShippingInfo), wallet, source || 'xaw888.com', orderImageUrl, orderQty]
         );
 
         await client.query('COMMIT');
