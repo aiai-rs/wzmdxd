@@ -131,6 +131,8 @@ const initDB = async () => {
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         `);
+        // 【新增】自动检测并添加 image_url 字段（修复订单不显示图片的问题）
+        try { await client.query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS image_url TEXT"); } catch(e){}
 
         // 3. 提现表
         await client.query(`
@@ -922,11 +924,19 @@ app.post('/api/order', async (req, res) => {
         let amount = 0;
 
         // 逻辑分支：购物车结算 vs 单品购买
+        let orderImageUrl = ''; // 【新增】定义订单图片变量
+
         if (productId === 'cart') {
-            prodName = "购物车商品";
+            // 【修改】不再叫"购物车商品"，而是拼接具体商品名
             if (!cartItems || !Array.isArray(cartItems) || cartItems.length === 0) {
                 throw new Error("购物车为空");
             }
+            // 拼接名字，例如：商品A x1 | 商品B x2
+            prodName = cartItems.map(i => `${i.name} x${i.quantity||1}`).join(' | ');
+            if(prodName.length > 200) prodName = prodName.substring(0, 197) + '...'; // 防止太长
+            
+            // 【新增】取购物车第一个商品的图片作为订单封面
+            if (cartItems.length > 0) orderImageUrl = cartItems[0].image_url || '';
 
             // 提取ID并查询数据库真实价格
             const itemIds = cartItems.map(i => i.id);
@@ -955,6 +965,7 @@ app.post('/api/order', async (req, res) => {
             if(prod) {
                 if (prod.stock <= 0) throw new Error('商品库存不足');
                 prodName = prod.name;
+                orderImageUrl = prod.image_url || ''; // 【新增】记录单品图片
                 amount = parseFloat(prod.price);
                 // [安全修复] 确保库存不会被扣减为负数 (虽然上面检查了，但为了数据库安全建议加个保险)
                 await client.query('UPDATE products SET stock = GREATEST(0, stock - 1) WHERE id = $1', [productId]);
@@ -993,11 +1004,11 @@ app.post('/api/order', async (req, res) => {
         }
 
         // 插入订单
-        // 【修改】增加了 source 字段
+        // 【修改】增加了 source 字段 和 image_url 字段
         await client.query(
-            `INSERT INTO orders (order_id, user_id, product_name, payment_method, usdt_amount, cny_amount, status, shipping_info, wallet, source, expires_at) 
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW() + INTERVAL '30 minutes')`,
-            [orderId, userId, prodName, paymentMethod, finalUSDT.toFixed(4), cnyAmount, orderStatus, JSON.stringify(finalShippingInfo), wallet, source || 'xaw888.com']
+            `INSERT INTO orders (order_id, user_id, product_name, payment_method, usdt_amount, cny_amount, status, shipping_info, wallet, source, image_url, expires_at) 
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW() + INTERVAL '30 minutes')`,
+            [orderId, userId, prodName, paymentMethod, finalUSDT.toFixed(4), cnyAmount, orderStatus, JSON.stringify(finalShippingInfo), wallet, source || 'xaw888.com', orderImageUrl]
         );
 
         await client.query('COMMIT');
@@ -1030,12 +1041,11 @@ app.post('/api/order', async (req, res) => {
 // 7. 获取订单
 app.get('/api/order', async (req, res) => {
     try {
+        // 【修改】直接查询 orders 表，图片现在存在 orders.image_url 里了，不再需要 LEFT JOIN
         const result = await pool.query(`
-            SELECT orders.*, products.image_url 
-            FROM orders 
-            LEFT JOIN products ON orders.product_name = products.name 
-            WHERE orders.user_id = $1 
-            ORDER BY orders.created_at DESC
+            SELECT * FROM orders 
+            WHERE user_id = $1 
+            ORDER BY created_at DESC
         `, [req.query.userId]);
         res.json(result.rows);
     } catch(e) { res.json([]); }
