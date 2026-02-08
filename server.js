@@ -879,7 +879,6 @@ app.delete('/api/admin/user/:id', adminAuth, async (req, res) => {
         res.status(500).json({success: false, msg: e.message});
     }
 });
-});
 
 // 4. 获取余额
 app.get('/api/user/balance', async (req, res) => {
