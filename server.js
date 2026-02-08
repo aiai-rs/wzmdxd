@@ -870,10 +870,15 @@ app.delete('/api/admin/user/:id', adminAuth, async (req, res) => {
         await pool.query('DELETE FROM orders WHERE user_id = $1', [uid]);
         await pool.query('DELETE FROM withdrawals WHERE user_id = $1', [uid]);
         await pool.query('DELETE FROM chats WHERE session_id = $1', [`user_${uid}`]);
+        
+        // [新增] 发送强制下线通知给该用户
+        io.to(`user_${uid}`).emit('force_logout');
+
         res.json({success: true});
     } catch(e) {
         res.status(500).json({success: false, msg: e.message});
     }
+});
 });
 
 // 4. 获取余额
