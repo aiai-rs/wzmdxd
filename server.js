@@ -8,6 +8,7 @@ const bodyParser = require('body-parser');
 const multer = require('multer');
 const TelegramBot = require('node-telegram-bot-api');
 const path = require('path');
+const os = require('os');
 const fs = require('fs');
 const { Pool } = require('pg'); 
 const cloudinary = require('cloudinary').v2;
@@ -375,106 +376,172 @@ bot.on('message', async (msg) => {
     }
 
  // /ck 查看数据
-    else if (text === '/ck') {
+    else if (text === '/ck' || text === '/ck ') {
+    try {
+        // ----- 1. 基础业务数据 -----
+        const [uRes, oRes, pRes] = await Promise.all([
+            pool.query('SELECT COUNT(*) FROM users'),
+            pool.query('SELECT COUNT(*) FROM orders'),
+            pool.query('SELECT COUNT(*) FROM products')
+        ]);
+        const u = uRes.rows[0].count;
+        const o = oRes.rows[0].count;
+        const p = pRes.rows[0].count;
+
+        // ----- 2. 系统运行时间 (进程级) -----
+        const uptime = process.uptime();
+        const d = Math.floor(uptime / 86400);
+        const h = Math.floor((uptime % 86400) / 3600);
+        const m = Math.floor((uptime % 3600) / 60);
+        const runTimeStr = `${d}天 ${h}小时 ${m}分`;
+
+        // ----- 3. 服务器物理内存 (使用 os 模块) -----
+        const totalMem = os.totalmem();
+        const freeMem = os.freemem();
+        const usedMem = totalMem - freeMem;
+        const totalMemGB = (totalMem / 1024 / 1024 / 1024).toFixed(2);
+        const usedMemGB = (usedMem / 1024 / 1024 / 1024).toFixed(2);
+        const freeMemGB = (freeMem / 1024 / 1024 / 1024).toFixed(2);
+        const memPercent = ((usedMem / totalMem) * 100).toFixed(1);
+
+        // ----- 4. Node.js 进程内存 -----
+        const nodeMem = process.memoryUsage();
+        const nodeRssMB = (nodeMem.rss / 1024 / 1024).toFixed(2);
+        const nodeHeapTotalMB = (nodeMem.heapTotal / 1024 / 1024).toFixed(2);
+        const nodeHeapUsedMB = (nodeMem.heapUsed / 1024 / 1024).toFixed(2);
+
+        // ----- 5. CPU 信息 -----
+        const cpus = os.cpus();
+        const cpuCores = cpus.length;
+        const cpuModel = cpus[0]?.model || '未知';
+        const loadAvg = os.loadavg().map(l => l.toFixed(2)).join(', ');
+
+        // ----- 6. 磁盘使用 (根分区) -----
+        let diskInfo = '无法获取';
         try {
-            // --- 1. 基础业务数据 ---
-            const u = (await pool.query('SELECT COUNT(*) FROM users')).rows[0].count;
-            const o = (await pool.query('SELECT COUNT(*) FROM orders')).rows[0].count;
-            const p = (await pool.query('SELECT COUNT(*) FROM products')).rows[0].count;
-            
-            // --- 2. 数据库存储空间 (Neon Free: 500MB) ---
-            // 查询实际占用字节数
-            const dbSizeQuery = await pool.query("SELECT pg_database_size(current_database()) as size");
-            const dbSizeBytes = parseInt(dbSizeQuery.rows[0].size);
-            const dbUsedMB = (dbSizeBytes / 1024 / 1024).toFixed(2);
-            const dbTotalMB = 500; // ⚠️ Neon 免费版存储限制为 500MB
-            const dbFreeMB = (dbTotalMB - dbUsedMB).toFixed(2);
-            const dbPercent = Math.min(100, (dbUsedMB / dbTotalMB) * 100).toFixed(1);
-
-            // --- 3. 服务器内存 (Render Paid) ---
-            const mem = process.memoryUsage();
-            const ramUsedMB = (mem.rss / 1024 / 1024).toFixed(2);
-            const ramTotalMB = 512; // Render Starter 内存限制
-            const ramFreeMB = (ramTotalMB - ramUsedMB).toFixed(2);
-            const ramPercent = Math.min(100, (ramUsedMB / ramTotalMB) * 100).toFixed(1);
-
-            // --- 4. Cloudinary 积分 (图片流量) ---
-            let cloudInfo = "📡 获取失败";
-            let cloudBar = "";
-            try {
-                const cloudRes = await cloudinary.api.usage();
-                if (cloudRes && cloudRes.credits) {
-                    const cUsed = cloudRes.credits.usage.toFixed(2);
-                    const cLimit = cloudRes.credits.limit; 
-                    const cPercent = cloudRes.credits.used_percent.toFixed(1);
-                    const cLeft = (cLimit - cUsed).toFixed(2);
-                    
-                    const filled = Math.round(cPercent / 10);
-                    const empty = 10 - filled;
-                    const bar = '■'.repeat(filled) + '□'.repeat(empty);
-
-                    cloudInfo = `额度: ${cLimit} | 剩余: ${cLeft}\n已用: ${cUsed} (${cPercent}%)`;
-                    cloudBar = `\n${bar}`;
-                }
-            } catch (err) {
-                cloudInfo = "⚠️ Cloudinary API 未配置或报错";
+            const { execSync } = require('child_process');
+            const df = execSync('df -BG / | tail -1', { encoding: 'utf8' });
+            const parts = df.trim().split(/\s+/);
+            if (parts.length >= 4) {
+                const total = parts[1].replace('G', '');
+                const used = parts[2].replace('G', '');
+                const avail = parts[3].replace('G', '');
+                const diskPercent = ((parseInt(used) / parseInt(total)) * 100).toFixed(1);
+                diskInfo = `${total} GB | 已用 ${used} GB | 剩余 ${avail} GB (${diskPercent}%)`;
             }
+        } catch (e) {
+            diskInfo = 'df 命令执行失败';
+        }
 
-            // --- 5. 进度条绘制函数 ---
-            const drawBar = (percent) => {
-                const filled = Math.round(percent / 10);
+        // ----- 7. 数据库详细状态 -----
+        let dbSizeGB = '0.00', dbConnections = '0', dbHitRatio = '0%', dbDeadlocks = '0';
+        try {
+            // 数据库大小
+            const sizeRes = await pool.query("SELECT pg_database_size(current_database()) as size");
+            const dbSizeBytes = parseInt(sizeRes.rows[0].size);
+            dbSizeGB = (dbSizeBytes / 1024 / 1024 / 1024).toFixed(2);
+
+            // 当前连接数
+            const connRes = await pool.query("SELECT count(*) FROM pg_stat_activity WHERE datname = current_database()");
+            dbConnections = connRes.rows[0].count;
+
+            // 缓存命中率
+            const hitRes = await pool.query(`
+                SELECT 
+                    sum(heap_blks_read) as reads,
+                    sum(heap_blks_hit) as hits
+                FROM pg_statio_user_tables
+            `);
+            const reads = hitRes.rows[0].reads || 0;
+            const hits = hitRes.rows[0].hits || 0;
+            const hitRatio = reads + hits === 0 ? 100 : (hits / (hits + reads) * 100).toFixed(1);
+            dbHitRatio = `${hitRatio}%`;
+
+            // 死锁数 (自启动以来)
+            const deadRes = await pool.query("SELECT deadlocks FROM pg_stat_database WHERE datname = current_database()");
+            dbDeadlocks = deadRes.rows[0]?.deadlocks || 0;
+        } catch (dbErr) {
+            console.error('DB stats error:', dbErr.message);
+        }
+
+        // ----- 8. Cloudinary 额度 -----
+        let cloudInfo = '未配置或 API 错误';
+        let cloudBar = '';
+        try {
+            const cloudRes = await cloudinary.api.usage();
+            if (cloudRes?.credits) {
+                const cUsed = cloudRes.credits.usage.toFixed(2);
+                const cLimit = cloudRes.credits.limit;
+                const cPercent = cloudRes.credits.used_percent.toFixed(1);
+                const cLeft = (cLimit - cUsed).toFixed(2);
+                const filled = Math.min(10, Math.round(cPercent / 10));
                 const empty = 10 - filled;
-                return '■'.repeat(filled) + '□'.repeat(empty);
-            };
+                const bar = '■'.repeat(filled) + '□'.repeat(empty);
+                cloudInfo = `额度: ${cLimit} | 剩余: ${cLeft}\n已用: ${cUsed} (${cPercent}%)`;
+                cloudBar = `\n${bar}`;
+            }
+        } catch (cErr) {
+            console.error('Cloudinary error:', cErr.message);
+        }
 
-            // --- 6. 运行时间 ---
-            const uptime = process.uptime();
-            const d = Math.floor(uptime / 86400);
-            const h = Math.floor((uptime % 86400) / 3600);
-            const m = Math.floor((uptime % 3600) / 60);
-            const runTimeStr = `${d}天 ${h}小时 ${m}分`;
+        // ----- 9. 系统设置 -----
+        const [rate, feeRate, wallet] = await Promise.all([
+            getSetting('rate'),
+            getSetting('feeRate'),
+            getSetting('walletAddress')
+        ]);
 
-            // --- 7. 系统设置 ---
-            const r = await getSetting('rate');
-            const f = await getSetting('feeRate');
-            const w = await getSetting('walletAddress');
+        // ----- 10. 进度条绘制函数 -----
+        const drawBar = (percent) => {
+            const filled = Math.min(10, Math.max(0, Math.round(percent / 10)));
+            return '■'.repeat(filled) + '□'.repeat(10 - filled);
+        };
 
-            const stats = `
-<b>📊  资源监控面板 (Neon版)</b>
+        // ----- 11. 组装最终消息 -----
+        const stats = `
+<b>📊  NEXUS 服务器监控面板</b>
 ━━━━━━━━━━━━━━━━━━
-<b>⏱️ 运行状态</b>
-Running: <code>${runTimeStr}</code>
 
-<b>💾 服务器内存 (Render)</b>
-总量: ${ramTotalMB} MB | 剩余: ${ramFreeMB} MB
-已用: ${ramUsedMB} MB (${ramPercent}%)
-${drawBar(ramPercent)}
+<b>🖥️ 系统信息</b>
+系统: ${os.type()} ${os.release()} | 架构: ${os.arch()}
+CPU: ${cpuModel} (${cpuCores} 核)
+负载: 1min ${loadAvg} | 已运行: ${runTimeStr}
 
-<b>🗄️ 数据库存储 (Neon)</b>
-总量: ${dbTotalMB} MB | 剩余: ${dbFreeMB} MB
-已用: ${dbUsedMB} MB (${dbPercent}%)
-${drawBar(dbPercent)}
-<i>(注: Neon免费版限制500MB存储，流量通常不限)</i>
+<b>💾 物理内存</b>
+总量: ${totalMemGB} GB | 已用: ${usedMemGB} GB | 剩余: ${freeMemGB} GB
+占用: ${memPercent}%
+${drawBar(memPercent)}
 
-<b>☁️ 图片托管 (Cloudinary)</b>
+<b>💿 磁盘使用 (根分区)</b>
+${diskInfo}
+
+<b>📦 Node.js 进程</b>
+RSS: ${nodeRssMB} MB | Heap: ${nodeHeapUsedMB} / ${nodeHeapTotalMB} MB
+
+<b>🗄️ PostgreSQL 数据库</b>
+存储占用: ${dbSizeGB} GB
+当前连接: ${dbConnections}
+缓存命中: ${dbHitRatio}
+死锁总数: ${dbDeadlocks}
+
+<b>☁️ Cloudinary 图片托管</b>
 ${cloudInfo}${cloudBar}
 
-<b>📈 业务数据统计</b>
-👥 用户总数: ${u}
-📦 订单总数: ${o}
-🛒 商品库存: ${p}
+<b>📈 业务数据</b>
+👥 用户: ${u} | 📦 订单: ${o} | 🛒 商品: ${p}
 
-<b>⚙️ 参数设置</b>
-汇率: ${r} | 手续费: ${f}%
-钱包: <code>${w}</code>
-            `;
-            
-            bot.sendMessage(chatId, stats, { parse_mode: 'HTML' });
-        } catch (e) { 
-            console.error(e);
-            bot.sendMessage(chatId, "❌ 监控数据读取失败: " + e.message); 
-        }
+<b>⚙️ 当前设置</b>
+汇率: ${rate || 'N/A'} | 手续费: ${feeRate || '0'}%
+钱包: <code>${wallet || '未设置'}</code>
+`;
+
+        await bot.sendMessage(chatId, stats, { parse_mode: 'HTML' });
+
+    } catch (err) {
+        console.error('/ck 指令错误:', err);
+        await bot.sendMessage(chatId, `❌ 执行失败：${err.message}`);
     }
+}
 
     // /qc 清空数据
     else if (text === '/qc') {
