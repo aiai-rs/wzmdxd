@@ -1735,8 +1735,13 @@ app.post('/api/callback/usdt_notify', async (req, res) => {
         const order = orderRes.rows[0];
 
         if (order && order.status === '待支付') {
-            // 校验金额是否一致 (允许 0.01 误差)
-            if (Math.abs(parseFloat(amount) - parseFloat(order.usdt_amount)) < 0.1) {
+            // [修改] 计算预期金额：数据库存的是基准金额，实际支付 = 基准 + (订单号后两位 % 30 / 100)
+            const randomCents = order.order_id.toString().slice(-2);
+            const randomDecimal = (parseInt(randomCents) % 30) / 100; // 这里的逻辑必须和前端完全一致
+            const expectedAmount = parseFloat(order.usdt_amount) + randomDecimal;
+
+            // 校验金额是否一致 (允许 0.05 误差，防止浮点数精度问题)
+            if (Math.abs(parseFloat(amount) - expectedAmount) < 0.05) {
                 await pool.query("UPDATE orders SET status = '已支付' WHERE order_id = $1", [order_id]);
                 
 // 如果是充值订单，增加余额
