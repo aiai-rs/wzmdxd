@@ -1767,12 +1767,13 @@ app.post('/api/callback/usdt_notify', async (req, res) => {
             }
         } else {
             res.send('ok'); // 订单已处理
-        }
+       }
     } catch (e) {
         console.error(e);
         res.status(500).send('error');
     }
-jh});jh
+});
+
 // 通用辅助函数：处理返利 (充值或消费)
 async function handleReferralBonus(userId, amount, type) {
     // type: '充值返利' 或 '消费返利'
