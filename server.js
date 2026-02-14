@@ -1737,42 +1737,42 @@ app.post('/api/callback/usdt_notify', async (req, res) => {
         if (order && order.status === '待支付') {
             // [修改] 计算预期金额：数据库存的是基准金额，实际支付 = 基准 + (订单号后两位 % 30 / 100)
             const randomCents = order.order_id.toString().slice(-2);
-            const randomDecimal = (parseInt(randomCents) % 30) / 100; // 这里的逻辑必须和前端完全一致
+            // 确保这里的逻辑和前端 showPaymentInfo 里的一模一样！
+            const randomDecimal = (parseInt(randomCents) % 30) / 100; 
             const expectedAmount = parseFloat(order.usdt_amount) + randomDecimal;
 
             // 校验金额是否一致 (允许 0.05 误差，防止浮点数精度问题)
             if (Math.abs(parseFloat(amount) - expectedAmount) < 0.05) {
                 await pool.query("UPDATE orders SET status = '已支付' WHERE order_id = $1", [order_id]);
                 
-// 如果是充值订单，增加余额
+                // 如果是充值订单，增加余额
                 if (order.product_name === '余额充值') {
-                    // 先给用户加余额 (这段逻辑原来在 handleRechargeSuccess 里，现在提取出来)
+                    // 先给用户加余额
                     await pool.query("UPDATE users SET balance = balance + $1 WHERE id = $2", [parseFloat(amount), order.user_id]);
                     
                     // [修改] 关闭充值返利 (注释掉下面这行)
                     // await handleReferralBonus(order.user_id, parseFloat(amount), '充值');
                 } else {
-                    // 如果是直接购买商品，触发消费返利 (保持不变，确保购买商品有返利)
+                    // 如果是直接购买商品，触发消费返利
                     await handleReferralBonus(order.user_id, parseFloat(amount), '消费');
                 }
 
-            // 【新增】关键：通知前端刷新余额和订单状态
-            io.to(`user_${order.user_id}`).emit('order_update');
+                // 【新增】关键：通知前端刷新余额和订单状态
+                io.to(`user_${order.user_id}`).emit('order_update');
 
-            sendTgNotify(`🤖 <b>USDT 自动回调成功</b>\n单号: ${order_id}\n金额: ${amount}`);
-            res.send('success');
+                sendTgNotify(`🤖 <b>USDT 自动回调成功</b>\n单号: ${order_id}\n金额: ${amount}`);
+                res.send('success');
+            } else {
+                res.send('amount_mismatch');
+            }
         } else {
-            res.send('amount_mismatch');
-        }
-    } else {
             res.send('ok'); // 订单已处理
         }
     } catch (e) {
         console.error(e);
         res.status(500).send('error');
     }
-});
-
+jh});jh
 // 通用辅助函数：处理返利 (充值或消费)
 async function handleReferralBonus(userId, amount, type) {
     // type: '充值返利' 或 '消费返利'
