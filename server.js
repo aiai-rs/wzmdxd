@@ -1634,6 +1634,25 @@ app.delete('/api/admin/product/:id', adminAuth, async (req, res) => {
     await broadcastGlobalUpdate();
     res.json({success:true});
 });
+
+app.post('/api/admin/product/pin/:id', adminAuth, async (req, res) => {
+    const productId = req.params.id;
+    try {
+        const productRes = await pool.query('SELECT is_pinned FROM products WHERE id = $1', [productId]);
+        if (productRes.rows.length === 0) return res.json({ success: false, msg: '商品不存在' });
+
+        const newStatus = !productRes.rows[0].is_pinned;
+        await pool.query('UPDATE products SET is_pinned = $1 WHERE id = $2', [newStatus, productId]);
+
+        // 关键：这两行负责让前端“动”起来
+        await broadcastGlobalUpdate(); // 告诉所有买家前端：刷新商品列表（按置顶排序）
+        notifyAdminUpdate();           // 告诉后台管理界面：刷新数据
+
+        res.json({ success: true, is_pinned: newStatus });
+    } catch (e) {
+        res.status(500).json({ success: false, msg: e.message });
+    }
+});
 // 招聘更新
 app.post('/api/admin/update/hiring', adminAuth, async (req, res) => {
     const list = req.body; // array
