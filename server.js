@@ -1,7 +1,5 @@
 const dns = require('dns');
 dns.setDefaultResultOrder('ipv4first');
-const dns = require('dns');
-dns.setDefaultResultOrder('ipv4first');
 const express = require('express');
 const http = require('http'); // 新增
 const { Server } = require("socket.io"); // 新增
@@ -60,17 +58,33 @@ const CLOUDINARY_API_KEY = process.env.CLOUDINARY_API_KEY;
 const CLOUDINARY_API_SECRET = process.env.CLOUDINARY_API_SECRET;
 
 if (CLOUDINARY_CLOUD_NAME && CLOUDINARY_API_KEY && CLOUDINARY_API_SECRET) {
-    cloudinary.config({
-        cloud_name: CLOUDINARY_CLOUD_NAME,
-        api_key: CLOUDINARY_API_KEY,
-        api_secret: CLOUDINARY_API_SECRET
-    });
+    cloudinary.config({
+        cloud_name: CLOUDINARY_CLOUD_NAME,
+        api_key: CLOUDINARY_API_KEY,
+        api_secret: CLOUDINARY_API_SECRET
+    });
 }
 
 if (!TG_BOT_TOKEN || !TG_ADMIN_GROUP_ID || !ADMIN_TOKEN || !DATABASE_URL) {
-    console.error("❌ 错误: 环境变量缺失。请检查 TG_BOT_TOKEN, TG_ADMIN_GROUP_ID, ADMIN_TOKEN, DATABASE_URL");
-    process.exit(1);
+    console.error("❌ 错误: 环境变量缺失。请检查 TG_BOT_TOKEN, TG_ADMIN_GROUP_ID, ADMIN_TOKEN, DATABASE_URL");
+    process.exit(1);
 }
+
+const bot = new TelegramBot(TG_BOT_TOKEN, { polling: false });
+const sendTgNotify = (text) => {
+    bot.sendMessage(TG_ADMIN_GROUP_ID, text, { parse_mode: 'HTML' }).catch(e => console.error("TG发送失败:", e.message));
+};
+
+process.on('uncaughtException', (err) => {
+    console.error('🚨 发生未捕获的异常:', err);
+    sendTgNotify(`🚨 <b>服务器崩溃预警 (未捕获异常)</b>\n原因: <code>${err.message}</code>`);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('🚨 发生未处理的 Promise 拒绝:', reason);
+    sendTgNotify(`🚨 <b>服务器异常预警 (Promise拒绝)</b>\n原因: <code>${reason}</code>`);
+});
+
 // ==========================================
 // 🔌 Socket.io 连接逻辑
 // ==========================================
@@ -79,23 +93,28 @@ io.on('connection', (socket) => {
 
     // 客户端加入房间 (房间号就是 session_id)
     socket.on('join_room', (room) => {
-        socket.join(room);
-        console.log(`Socket ${socket.id} 加入房间: ${room}`);
-    });
+        socket.join(room);
+        console.log(`Socket ${socket.id} 加入房间: ${room}`);
+    });
 
- socket.on('disconnect', () => {
-        console.log('用户断开连接:', socket.id);
-    });
+ socket.on('disconnect', () => {
+        console.log('用户断开连接:', socket.id);
+    });
 });
 
 // [新增] 定义广播函数，通知所有后台管理员刷新数据
 const notifyAdminUpdate = () => {
-    io.emit('admin_update', { timestamp: Date.now() });
+    io.emit('admin_update', { timestamp: Date.now() });
 };
 
 const pool = new Pool({
-    connectionString: DATABASE_URL,
-    ssl: { rejectUnauthorized: false }
+    connectionString: DATABASE_URL,
+    ssl: { rejectUnauthorized: false }
+});
+
+pool.on('error', (err, client) => {
+    console.error('❌ 数据库连接池发生意外错误:', err.message);
+    sendTgNotify(`⚠️ <b>数据库连接异常断开</b>\n不影响运行，系统已自动重连。\n详情: <code>${err.message}</code>`);
 });
 
 const initDB = async () => {
@@ -339,15 +358,10 @@ const setSetting = async (key, value) => {
 // ==========================================
 // 🤖 Telegram 机器人逻辑
 // ==========================================
-const bot = new TelegramBot(TG_BOT_TOKEN, { polling: false });
-
-const sendTgNotify = (text) => {
-    bot.sendMessage(TG_ADMIN_GROUP_ID, text, { parse_mode: 'HTML' }).catch(e => console.error("TG发送失败:", e.message));
-};
 
 bot.on('message', async (msg) => {
-    const chatId = msg.chat.id;
-    const type = msg.chat.type;
+    const chatId = msg.chat.id;
+    const type = msg.chat.type;
     const text = msg.text ? msg.text.trim() : '';
 
     // 1. 私聊静默
@@ -1911,15 +1925,16 @@ const startServer = async () => {
         console.log("✅ 数据库表结构准备就绪");
 
         console.log("⏳ 2. 正在启动 Telegram 机器人...");
-        // 数据库好了，手动启动机器人
-        await bot.startPolling();
-        console.log("✅ 机器人已上线");
+                // 数据库好了，手动启动机器人
+                await bot.startPolling();
+                console.log("✅ 机器人已上线");
 
-       console.log("⏳ 3. 正在启动 Web 服务器...");
-        // [修改] 使用 server.listen 而不是 app.listen
-        server.listen(PORT, () => {
-            console.log(`🚀 Server running on port ${PORT}`);
-        }); // <--- 注意这里：必须有 }); 这三个符号
+               console.log("⏳ 3. 正在启动 Web 服务器...");
+                // [修改] 使用 server.listen 而不是 app.listen
+                server.listen(PORT, () => {
+                    console.log(`🚀 Server running on port ${PORT}`);
+                    sendTgNotify(`✅ <b>服务器已成功上线</b>\n端口: <code>${PORT}</code>\n系统初始化完毕，正在运行中。`);
+                }); 
 
     } catch (error) {
         console.error("❌ 启动失败，请检查数据库连接:", error);
